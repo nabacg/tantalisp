@@ -1,11 +1,16 @@
 mod lexer;
+mod parser;
 
 use anyhow::Result;
 use lexer::tokenize;
+use parser::parse;
 
 pub fn rep(input: &str) -> Result<()> {
     let tokens = tokenize(input)?;
     println!("Tokens:\n{}", tokens.iter().map(|t| format!("{:?}", t)).collect::<Vec<_>>().join("\n"));
+    let ast = parse(&tokens[..])?;
+    println!("AST:\n{}", ast.iter().map(|t| format!("{:?}", t)).collect::<Vec<_>>().join("\n"));
+    
     Ok(())
 }
 
