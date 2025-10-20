@@ -1,6 +1,6 @@
-use std::{any, collections::HashMap, result};
+use std::collections::HashMap;
 
-use inkwell::{basic_block::BasicBlock, builder::Builder, context::{self, Context}, execution_engine::{self, JitFunction}, module::Module, values::{FunctionValue, IntValue}};
+use inkwell::{builder::Builder, context::Context, execution_engine::JitFunction, module::Module, values::{FunctionValue, IntValue}};
 use anyhow::{anyhow, bail, Result};
 use crate::parser::SExpr;
 
@@ -322,10 +322,14 @@ mod compiler_tests {
     fn integer_math() {
         let ctx = Context::create();
         let mut compiler = CodeGen::new(&ctx);
-        let res = compiler.emit_expr(&SExpr::List(
-            vec![SExpr::Symbol("+".to_string()), SExpr::Int(41), SExpr::Int(1)]));
-        println!("res={:?}", res);
-        assert!(res.is_ok());
+
+        let expr = SExpr::List(
+            vec![SExpr::Symbol("+".to_string()), SExpr::Int(41), SExpr::Int(1)]
+        );
+
+        let result = compiler.compile_and_run(&[expr]);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
     }
 
     #[test]
