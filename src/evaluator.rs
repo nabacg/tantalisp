@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use crate::parser::SExpr;
 use anyhow::{bail, anyhow, Result};
-use std::rc::Rc;
-use std::cell::RefCell;
 
 // ===== Builtin Functions =====
 
@@ -185,6 +183,7 @@ pub fn eval_with_env(env: &mut Environment, exprs: Vec<SExpr>) -> Result<SExpr> 
         .last()
         .unwrap()
 }
+// (def fib (fn [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))))
 
 
 fn eval_expr(env: &mut Environment, expr: SExpr) -> Result<SExpr> {
@@ -340,7 +339,7 @@ impl<'a> Environment<'a> {
         if self.bindings.contains_key(name) {
             self.bindings.insert(name.to_string(), value);
             Ok(())
-        } else if let Some(parent) = &mut self.parent {
+        } else if let Some(_parent) = &mut self.parent {
              bail!("Cannot mutate parent through shared ref")
         } else {
             bail!("Undefined variable: {}", name)
