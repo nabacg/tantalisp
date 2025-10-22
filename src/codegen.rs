@@ -501,6 +501,8 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
 
+
+
     // Box a string from a runtime i8* pointer and length
     fn box_string_from_ptr(
         &mut self,
@@ -644,6 +646,22 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(str_ptr)
     }
 
+    fn unbox_lambda(&mut self, lisp_value_ptr: PointerValue<'ctx>) -> Result<PointerValue<'ctx>> {
+        let tag= self.get_tag(lisp_value_ptr)?;
+        let expected_tag = self.ctx.i8_type().const_int(TAG_LAMBDA as u64, false);
+        self.builder.build_int_compare(IntPredicate::EQ, tag, expected_tag, "is_lambda_tag")?;
+        //TODO - branch and throw error, leaving for now
+
+        let int_data_ptr = self.builder.build_struct_gep(self.lisp_val_type, lisp_value_ptr, 1 , "data_ptr")?;
+        let data = self.builder.build_load(self.ctx.i64_type(), int_data_ptr, "load_data_ptr")?.into_int_value();
+
+        let lambda_ptr = self.builder.build_int_to_ptr(data, self.ctx.ptr_type(AddressSpace::default()), "int_data_to_ptr")?;
+
+        Ok(lambda_ptr)
+
+
+    }
+
 // Lisp Cons cell type
 // In C, this would be:
 // struct LispList {
@@ -694,7 +712,29 @@ impl<'ctx> CodeGen<'ctx> {
             return Ok(result)
         }
 
-        bail!("FunctionCalls for lisp functions not implemented yet!")
+        let func = self.emit_expr(func)?;
+        let func_ptr = self.unbox_lambda(func)?;
+        let ptr_type = self.ctx.ptr_type(AddressSpace::default());
+
+        let args: Vec<_> = args.iter().map(|a| self.emit_expr(a)).collect::<Result<Vec<_>>>()?;
+
+        let args: Vec<_> = args.iter().map(|a| (*a).into()).collect();   
+        let param_types:Vec<_> = args
+            .iter()
+            .map(|_| ptr_type.into())
+            .collect();
+
+        let fn_type = ptr_type.fn_type(&param_types, false);
+
+        let call_res = self.builder
+            .build_indirect_call(fn_type, func_ptr, &args, "lambda_call")
+            .map_err(|e| anyhow!("error making indirect_call: {}", e))?;
+
+        let res = call_res.try_as_basic_value().left().ok_or(anyhow!("error converting indirect_call CallSite to PointerValue"))?;
+
+        Ok(res.into_pointer_value())
+
+        // bail!("FunctionCalls for lisp functions not implemented yet!")
 
     }
 
