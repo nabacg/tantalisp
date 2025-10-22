@@ -1,42 +1,58 @@
 use anyhow::Result;
-use tantalisp::{rep, rep_with_env, Environment};
+use clap::Parser;
+use tantalisp::{Tantalisp};
 use std::{env, fs, io::{self, Read, Write, BufRead}};
 use anyhow::bail;
 
-fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(short, long, default_value = None)]
+    file: Option<String>,
+    
+    #[arg(short, long, default_value_t = false)]
+    debug: bool,
+    
+    #[arg(short, long, default_value_t = false)]
+    interpreter: bool
 
-    match &args[..] {
-        [_cmd, input_file] => {
+
+}
+
+fn main() -> Result<()> {
+    // let args: Vec<String> = env::args().collect();
+    let args = Args::parse();
+
+    let mut lisp = Tantalisp::new(args.debug, args.interpreter);
+ 
+    match args.file {
+        Some(file) => {
             // Read from file
-            let sources = fs::read_to_string(input_file)?;
-            rep(&sources)
-        }
-        [_cmd] => {
+            let sources = fs::read_to_string(file)?;
+ 
+            lisp.rep(&sources)
+        },
+        None => {
             // Check if stdin is a terminal (interactive) or a pipe
             if atty::is(atty::Stream::Stdin) {
                 // Interactive REPL mode
-                repl()
+                repl(&mut lisp)
             } else {
                 // Piped input mode
                 let mut sources = String::new();
                 io::stdin().read_to_string(&mut sources)?;
-                rep(&sources)
+                lisp.rep(&sources)
             }
         }
-        _ => bail!("Usage: {} [filename]\nIf no filename provided, starts REPL or reads from stdin", args[0])
     }
 }
 
-fn repl() -> Result<()> {
+fn repl(lisp: &mut Tantalisp) -> Result<()> {
     println!("Tantalisp REPL");
     println!("Type expressions to evaluate. Press Ctrl+D (Unix) or Ctrl+Z (Windows) to exit.");
     println!("Special commands: :quit or :q to exit");
     println!();
 
-    // Create persistent environment for the REPL session
-    let mut env = Environment::global();
-
+    
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut line = String::new();
@@ -67,7 +83,7 @@ fn repl() -> Result<()> {
                 }
 
                 // Evaluate the expression with persistent environment
-                match rep_with_env(&mut env, input) {
+                match lisp.rep_with_env(input) {
                     Ok(_) => {},
                     Err(e) => eprintln!("Error: {}", e),
                 }

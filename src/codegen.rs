@@ -5,9 +5,9 @@ use anyhow::{anyhow, bail, Result};
 use crate::parser::SExpr;
 
 
-pub fn compile_and_run(exprs: &[SExpr]) -> Result<i32> {
+pub fn compile_and_run(exprs: &[SExpr], debug_mode: bool) -> Result<i32> {
     let ctx = Context::create();
-    let mut codegen = CodeGen::new(&ctx);
+    let mut codegen = CodeGen::new(&ctx, debug_mode);
 
     codegen.compile_and_run(exprs)
 }
@@ -36,7 +36,9 @@ pub struct CodeGen<'ctx> {
     environment: HashMap<String, PointerValue<'ctx>>,
 
     //track function parameters during lambda compilation
-    current_function: Option<FunctionValue<'ctx>>
+    current_function: Option<FunctionValue<'ctx>>,
+    // print debug info like LLVM IR
+    debug: bool
 
 }
 
@@ -50,7 +52,7 @@ const TAG_LAMBDA: u8 = 5;
 
 impl<'ctx> CodeGen<'ctx> {
    
-    pub fn new(ctx: &'ctx Context) -> Self {
+    pub fn new(ctx: &'ctx Context, debug_mode: bool) -> Self {
         let module = ctx.create_module("tantalisp_main");
         let builder = ctx.create_builder();
 
@@ -101,7 +103,8 @@ impl<'ctx> CodeGen<'ctx> {
             free_fn,
             memcpy_fn: memcpy,
             environment: HashMap::new(),
-            current_function: None
+            current_function: None,
+            debug: debug_mode
         }
     }
 
@@ -124,10 +127,12 @@ impl<'ctx> CodeGen<'ctx> {
         // return the pointer to LispVal
         self.builder.build_return(Some(result_ptr))?;
 
-        // print LLVM IR 
-        println!("-------- LLVM IR ---------");
-        self.module.print_to_stderr();
-        println!("--------------------------");
+        if self.debug {
+            // print LLVM IR 
+            println!("-------- LLVM IR ---------");
+            self.module.print_to_stderr();
+            println!("--------------------------");
+        }
 
 
         let execution_engine = self.module
