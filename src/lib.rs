@@ -3,6 +3,8 @@ mod parser;
 mod evaluator;
 mod codegen;
 
+use std::io::{self, BufRead, Write};
+
 use anyhow::{anyhow, Result};
 use lexer::tokenize;
 use parser::parse;
@@ -15,16 +17,16 @@ pub use evaluator::Environment;
 pub struct Tantalisp<'l> {
     debug_mode: bool,
     interpreted_mode: bool,
-    interpreter_env: Environment<'l>
+    interpreter_env: Option<Environment<'l>>
 }
 
 impl<'l> Tantalisp<'l> {
     pub fn new(debug_mode: bool, interpreted_mode: bool) -> Self {
         let interpreter_env  = 
         if interpreted_mode {
-            Environment::global()
+            Some(Environment::global())
         } else {
-            Environment::new()
+            None
         };
         Self { 
             debug_mode, 
@@ -33,6 +35,62 @@ impl<'l> Tantalisp<'l> {
         }
     }
 
+   pub fn repl(&mut self) -> Result<()> {
+        let mode = if self.interpreted_mode { "interpreter" } else { "JIT compiler" };
+        let debug = if self.debug_mode { "ON" } else { "OFF" };
+    
+        println!("Tantalisp REPL");
+        println!("Mode: {} | Debug: {}", mode, debug);
+        println!("Type expressions to evaluate. Press Ctrl+D (Unix) or Ctrl+Z (Windows) to exit.");
+        println!("Special commands: :quit or :q to exit");
+        println!();
+    
+        
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        let mut line = String::new();
+    
+        loop {
+            print!("tantalisp> ");
+            io::stdout().flush()?;
+    
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    // EOF (Ctrl+D)
+                    println!("\nBye!");
+                    break;
+                }
+                Ok(_) => {
+                    let input = line.trim();
+    
+                    // Skip empty lines
+                    if input.is_empty() {
+                        continue;
+                    }
+    
+                    // Handle special REPL commands
+                    if input == ":quit" || input == ":q" {
+                        println!("Bye!");
+                        break;
+                    }
+    
+                    // Evaluate the expression with persistent environment
+                    match self.rep_with_env(input) {
+                        Ok(_) => {},
+                        Err(e) => eprintln!("Error: {}", e),
+                    }
+                    println!(); // Blank line between evaluations
+                }
+                Err(e) => {
+                    eprintln!("Error reading input: {}", e);
+                    break;
+                }
+            }
+        }
+    
+        Ok(())
+    }
 
     pub fn rep(&self, input: &str) -> Result<()> {
         let tokens = tokenize(input)?;
@@ -62,7 +120,8 @@ impl<'l> Tantalisp<'l> {
         let tokens = tokenize(input)?;
         let ast = parse(&tokens[..])?;
         if self.interpreted_mode {
-            let result = eval_with_env(&mut  self.interpreter_env, ast)?;
+            let env = self.interpreter_env.as_mut().ok_or(anyhow!("interpreter_mode: ON but missing interpreter_env!"))?;
+            let result = eval_with_env(env, ast)?;
             println!("{}", result);
 
         } else {
