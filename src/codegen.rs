@@ -696,21 +696,21 @@ impl<'ctx> CodeGen<'ctx> {
             }
         }
 
-        if let SExpr::LambdaExpr(params, body) = func { 
-            let llvm_function = self.emit_lambda(params, body);
-            let args: Vec<_> = args.iter().map(|a| self.emit_expr(a)).collect::<Result<Vec<_>>>()?;
+        // if let SExpr::LambdaExpr(params, body) = func { 
+        //     let llvm_function = self.emit_lambda(params, body);
+        //     let args: Vec<_> = args.iter().map(|a| self.emit_expr(a)).collect::<Result<Vec<_>>>()?;
 
-            // Convert to BasicMetadataValueEnum for call
-            let args: Vec<_> = args.iter().map(|a| (*a).into()).collect();   
+        //     // Convert to BasicMetadataValueEnum for call
+        //     let args: Vec<_> = args.iter().map(|a| (*a).into()).collect();   
 
-            let call_site = self.builder.build_call(llvm_function?, &args, "lambda_call")?;
+        //     let call_site = self.builder.build_call(llvm_function?, &args, "lambda_call")?;
 
-            let result = call_site.try_as_basic_value().left().ok_or(anyhow!("Failed to get lambda_call result"));
+        //     let result = call_site.try_as_basic_value().left().ok_or(anyhow!("Failed to get lambda_call result"));
 
-            let result = result?.into_pointer_value();
+        //     let result = result?.into_pointer_value();
 
-            return Ok(result)
-        }
+        //     return Ok(result)
+        // }
 
         let func = self.emit_expr(func)?;
         let func_ptr = self.unbox_lambda(func)?;
@@ -1008,5 +1008,48 @@ mod compiler_tests {
         let result2 = codegen.repl_compile(&[read_expr]);
         assert!(result2.is_ok(), "Failed to read x: {:?}", result2.err());
         assert_eq!(result2.unwrap(), 42);
+    }
+
+    #[test]
+    fn test_repl_lambda_with_globals() {
+        // Test: (def x 40) (def f (fn [x] (* x 10))) (f (+ 2 x))
+        // Expected: 420
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, false);
+
+        // Line 1: (def x 40)
+        let def_x = SExpr::DefExpr(
+            "x".to_string(),
+            Box::new(SExpr::Int(40))
+        );
+        // Line 2: (def f (fn [x] (* x 10)))
+        let lambda = SExpr::LambdaExpr(
+            vec![SExpr::Symbol("x".to_string())],
+            vec![SExpr::List(vec![
+                SExpr::Symbol("*".to_string()),
+                SExpr::Symbol("x".to_string()),
+                SExpr::Int(10),
+            ])]
+        );
+        let def_f = SExpr::DefExpr(
+            "f".to_string(),
+            Box::new(lambda)
+        );
+
+                // Line 3: (f (+ 2 x))
+        // This is: (f (+ 2 40)) = (f 42) = (* 42 10) = 420
+        let call_expr = SExpr::List(vec![
+            SExpr::Symbol("f".to_string()),
+            SExpr::List(vec![
+                SExpr::Symbol("+".to_string()),
+                SExpr::Int(2),
+                SExpr::Symbol("x".to_string()),
+            ])
+        ]);
+
+        let result1 = codegen.repl_compile(&[def_x, def_f, call_expr]);
+        assert!(result1.is_ok(), "Failed to define x: {:?}", result1.err());
+        assert_eq!(result1.unwrap(), 420);
+
     }
 }
