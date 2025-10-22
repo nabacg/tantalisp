@@ -6,10 +6,11 @@ mod codegen;
 use std::io::{self, BufRead, Write};
 
 use anyhow::{anyhow, Result};
+use inkwell::context::Context;
 use lexer::tokenize;
 use parser::parse;
 use evaluator::{eval, eval_with_env};
-use codegen::compile_and_run;
+use codegen::CodeGen;
 
 // Re-export Environment for REPL
 pub use evaluator::Environment;
@@ -17,21 +18,31 @@ pub use evaluator::Environment;
 pub struct Tantalisp<'l> {
     debug_mode: bool,
     interpreted_mode: bool,
-    interpreter_env: Option<Environment<'l>>
+    interpreter_env: Option<Environment<'l>>,
+    codegen: Option<CodeGen<'l>>
 }
 
 impl<'l> Tantalisp<'l> {
     pub fn new(debug_mode: bool, interpreted_mode: bool) -> Self {
-        let interpreter_env  = 
         if interpreted_mode {
-            Some(Environment::global())
+
+            Self { 
+                debug_mode, 
+                interpreted_mode,
+                interpreter_env: Some(Environment::global()), 
+                codegen: None,
+            }
         } else {
-            None
-        };
-        Self { 
-            debug_mode, 
-            interpreted_mode,
-            interpreter_env
+            // allocate Ctx and don't store it, it will outlive codegen
+            // TODO - find a more correct solution, but it's late 
+            let ctx = Box::leak(Box::new(Context::create()));
+
+            Self { 
+                debug_mode, 
+                interpreted_mode,
+                interpreter_env: None, 
+                codegen: Some(CodeGen::new(ctx, debug_mode))
+            }
         }
     }
 
@@ -92,7 +103,7 @@ impl<'l> Tantalisp<'l> {
         Ok(())
     }
 
-    pub fn rep(&self, input: &str) -> Result<()> {
+    pub fn rep(&mut self, input: &str) -> Result<()> {
         let tokens = tokenize(input)?;
         if self.debug_mode {
             println!("Tokens:\n{}", tokens.iter().map(|t| format!("{:?}", t)).collect::<Vec<_>>().join("\n"));
@@ -106,7 +117,9 @@ impl<'l> Tantalisp<'l> {
             let result = eval(ast)?;
             println!("Result:\n{}", result);
         } else {
-            let result = compile_and_run(&ast, self.debug_mode)?;
+            let codegen = self.codegen.as_mut().ok_or(anyhow!("compiled_mode but empty codegen"))?;
+
+            let result = codegen.compile_and_run(&ast)?;
             println!("Result:\n{}", result);
 
         }
@@ -125,8 +138,9 @@ impl<'l> Tantalisp<'l> {
             println!("{}", result);
 
         } else {
+            let codegen = self.codegen.as_mut().ok_or(anyhow!("compiled_mode but empty codegen"))?;
 
-            let result = compile_and_run(&ast, self.debug_mode)?;
+            let result = codegen.repl_compile(&ast)?;
             println!("{}", result);
         }
 

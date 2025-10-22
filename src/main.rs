@@ -1,8 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use tantalisp::{Tantalisp};
-use std::{env, fs, io::{self, Read, Write, BufRead}};
-use anyhow::bail;
+use std::{fs, io::{self, Read}};
 
 #[derive(Parser, Debug)]
 struct Args {

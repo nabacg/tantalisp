@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::atomic};
 
-use inkwell::{builder::Builder, context::Context, execution_engine::JitFunction, module::Module, types::StructType, values::{FunctionValue, IntValue, PointerValue}, AddressSpace, IntPredicate};
+use inkwell::{builder::Builder, context::Context, execution_engine::{ExecutionEngine, JitFunction}, module::Module, types::StructType, values::{FunctionValue, GlobalValue, IntValue, PointerValue}, AddressSpace, IntPredicate};
 use anyhow::{anyhow, bail, Result};
 use crate::parser::SExpr;
 
@@ -10,6 +10,12 @@ pub fn compile_and_run(exprs: &[SExpr], debug_mode: bool) -> Result<i32> {
     let mut codegen = CodeGen::new(&ctx, debug_mode);
 
     codegen.compile_and_run(exprs)
+}
+
+pub fn repl_compile(ctx: &Context, exprs: &[SExpr], debug_mode: bool) -> Result<i32> {
+    let mut codegen = CodeGen::new(ctx, debug_mode);
+
+    codegen.repl_compile(exprs)
 }
 
 #[repr(C)]
@@ -23,6 +29,7 @@ pub struct CodeGen<'ctx> {
     ctx: &'ctx Context,
     module: Module<'ctx>,
     builder: Builder<'ctx>,
+    execution_engine: Option<ExecutionEngine<'ctx>>,
 
     //the boxed type LispVal
     lisp_val_type: StructType<'ctx>,
@@ -33,7 +40,10 @@ pub struct CodeGen<'ctx> {
     memcpy_fn: FunctionValue<'ctx>,
 
     //variables in current scope, dummy environment
-    environment: HashMap<String, PointerValue<'ctx>>,
+    local_env: HashMap<String, PointerValue<'ctx>>,
+
+    // Track global variables defined in REPL
+    global_env: HashMap<String, GlobalValue<'ctx>>,
 
     //track function parameters during lambda compilation
     current_function: Option<FunctionValue<'ctx>>,
@@ -98,14 +108,96 @@ impl<'ctx> CodeGen<'ctx> {
             ctx,
             module,
             builder,
+            execution_engine: None,
             lisp_val_type: lisp_value_type,
             malloc_fn,
             free_fn,
             memcpy_fn: memcpy,
-            environment: HashMap::new(),
+            local_env: HashMap::new(),
+            global_env: HashMap::new(),
             current_function: None,
             debug: debug_mode
         }
+    }
+
+    // compile_and_run version for REPL, doesn't create fresh execution engine each time, 
+    // thus allows defining global vars and re-using them in subsequent executions
+    pub fn repl_compile(&mut self, exprs: &[SExpr]) -> Result<i32> {
+        let ptr_type = self.ctx.ptr_type(AddressSpace::default());
+
+        //Generate unique function name for each REAPL line
+        static COUNTER: atomic::AtomicUsize = 
+            atomic::AtomicUsize::new(0);
+
+        let repl_line_fn_name = format!("repl_eval_fn_{}", COUNTER.fetch_add(1, atomic::Ordering::SeqCst));
+        let repl_fn_type = ptr_type.fn_type(&[], false);
+        let repl_fn = self.module.add_function(&repl_line_fn_name, repl_fn_type, None);
+        let entry_bb = self.ctx.append_basic_block(repl_fn, "repl_entry");
+
+        self.builder.position_at_end(entry_bb);
+        self.current_function = Some(repl_fn);
+
+        //Clear local environment 
+        self.local_env.clear();
+        
+        // Compile exprs
+        let compiled_repl_exprs: Result<Vec<_>> = exprs.iter().map(|e| self.emit_expr(e)).collect();
+        let compiled_exprs = compiled_repl_exprs?;
+        let result_ptr = compiled_exprs.last().ok_or(anyhow!("empty body"))?;
+
+        self.builder.build_return(Some(result_ptr))?;
+
+        if !repl_fn.verify(true) {
+            bail!("Function verification failed");
+        }
+
+
+        if self.debug {
+            // print LLVM IR 
+            println!("-------- LLVM IR ---------");
+            self.module.print_to_stderr();
+            println!("--------------------------");
+        }
+
+        let engine = self.get_or_create_execution_engine()?;
+
+        unsafe {
+            type MainFunc = unsafe extern "C" fn() -> *mut LispValLayout;
+            //get handle to the main function
+            let jit_function: JitFunction<MainFunc> = engine.get_function(&repl_line_fn_name)?;
+
+            //call it
+            let lisp_val_ptr = jit_function.call();
+            if lisp_val_ptr.is_null() {
+                bail!("JIT returned null pointer");
+            }
+            let lisp_val = &*lisp_val_ptr;
+            match lisp_val.tag {
+                0 => Ok(lisp_val.data as i32), // Int
+                1 => Ok(lisp_val.data as i32), // Bool
+                _ => bail!("Other LispVal types not implemented yet, found: {}", lisp_val.tag)
+            }
+
+        }
+     
+
+
+    }
+
+
+    fn create_execution_engine(&mut self) -> Result<ExecutionEngine<'ctx>> {
+        self.module.create_jit_execution_engine(inkwell::OptimizationLevel::None)
+                .map_err(|e| anyhow!("Failed to create JIT execution engine: {}", e))
+    }
+
+    fn get_or_create_execution_engine(&mut self) -> Result<&ExecutionEngine<'ctx>> {
+        if self.execution_engine.is_none() {
+            let engine = self.module.create_jit_execution_engine(inkwell::OptimizationLevel::None)
+                .map_err(|e| anyhow!("Failed to create JIT execution engine: {}", e))?;
+            self.execution_engine = Some(engine);
+        }
+
+        Ok(self.execution_engine.as_ref().unwrap())
     }
 
     pub fn compile_and_run(&mut self, exprs: &[SExpr])  -> Result<i32> {
@@ -135,32 +227,27 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
 
-        let execution_engine = self.module
-            .create_jit_execution_engine(inkwell::OptimizationLevel::None);
+        let engine = self.create_execution_engine()?;
 
-        if let Ok(engine) = execution_engine {
-            unsafe {
-                type MainFunc = unsafe extern "C" fn() -> *mut LispValLayout;
-                //get handle to the main function
-                let jit_function: JitFunction<MainFunc> = engine.get_function(main_fn_name)?;
-    
-                //call it
-                let lisp_val_ptr = jit_function.call();
-                if lisp_val_ptr.is_null() {
-                    bail!("JIT returned null pointer");
-                }
-                let lisp_val = &*lisp_val_ptr;
-                match lisp_val.tag {
-                    0 => Ok(lisp_val.data as i32), // Int
-                    1 => Ok(lisp_val.data as i32), // Bool
-                    _ => bail!("Other LispVal types not implemented yet, found: {}", lisp_val.tag)
-                }
+        unsafe {
+            type MainFunc = unsafe extern "C" fn() -> *mut LispValLayout;
+            //get handle to the main function
+            let jit_function: JitFunction<MainFunc> = engine.get_function(main_fn_name)?;
 
+            //call it
+            let lisp_val_ptr = jit_function.call();
+            if lisp_val_ptr.is_null() {
+                bail!("JIT returned null pointer");
             }
-        }    else {
-            bail!("Failed to create_jit_execution_engine")
-        }
+            let lisp_val = &*lisp_val_ptr;
+            match lisp_val.tag {
+                0 => Ok(lisp_val.data as i32), // Int
+                1 => Ok(lisp_val.data as i32), // Bool
+                _ => bail!("Other LispVal types not implemented yet, found: {}", lisp_val.tag)
+            }
 
+
+        }
 
 
     }
@@ -175,10 +262,46 @@ impl<'ctx> CodeGen<'ctx> {
                 self.ctx.i8_type().const_zero()
             }),
             SExpr::String(str) => self.box_string(str),
-            SExpr::Symbol(id) => self.environment
-                                            .get(id)
-                                            .copied()
-                                            .ok_or_else(|| anyhow::anyhow!("Undefined variable: {}", id)),
+            SExpr::Symbol(id) => { 
+                
+                // first check in local env
+                if let Some(val) = self.local_env.get(id) {
+                    return Ok(*val)
+                }
+
+                // then in global 
+                if let Some(global) = self.global_env.get(id) {
+                    let loaded = self.builder.build_load(
+                            self.ctx.ptr_type(
+                                AddressSpace::default()),
+                                global.as_pointer_value(), 
+                                &format!("load_{}", id))?;
+                    return Ok(loaded.into_pointer_value())
+                }
+
+                bail!("Undefined variable: {}, known globals: {:?}", id, self.global_env.keys())
+            },
+            SExpr::DefExpr(id, val_expr) => {
+                let ptr_type = self.ctx.ptr_type(AddressSpace::default());
+
+                let val_ptr = self.emit_expr(&*val_expr)?;
+                let global_var_name = format!("global_{}", id);
+                // get or create global_var
+                let global_var = self.module.add_global(ptr_type, 
+                    None, 
+                    &global_var_name);
+
+                //initialize to null (llvm requirement)    
+                global_var.set_initializer(&ptr_type.const_null());
+
+                // emit STORE instruction
+                self.builder.build_store(global_var.as_pointer_value(), val_ptr)?;
+
+                // insert handle to that var into global_env, so we can look it up later
+                self.global_env.insert(id.clone(), global_var);
+
+                Ok(val_ptr)
+            },
             SExpr::IfExpr(pred_expr, truthy_exprs, falsy_exprs) => {
                 // let current_function = self.current_function.ok_or_else(anyhow!("Cannot codegen IfExpr with out current_function!"))?;
                 // let pred_value = self.codegen_expr(*pred_expr)?;
@@ -209,11 +332,6 @@ impl<'ctx> CodeGen<'ctx> {
             SExpr::LambdaExpr(params, body) => { 
                 let lambda_val = self.emit_lambda(params, body)?;
                 self.box_lambda(lambda_val)
-            },
-            SExpr::DefExpr(id, val_expr) => {
-                let val = self.emit_expr(&*val_expr)?;
-                self.environment.insert(id.clone(), val);
-                Ok(val)
             },
             SExpr::List(xs) if xs.is_empty() => self.box_nil(),
             SExpr::List(sexprs) => self.emit_call(&sexprs),
@@ -606,7 +724,7 @@ impl<'ctx> CodeGen<'ctx> {
 
 
         // save current CodeGen state
-        let current_env = self.environment.clone();
+        let current_env = self.local_env.clone();
         let current_fn = self.current_function;
 
         //also save current insertion point
@@ -621,13 +739,13 @@ impl<'ctx> CodeGen<'ctx> {
         self.current_function = Some(new_lambda);
 
         // create new_lamda environment
-        self.environment.clear();
+        self.local_env.clear();
         for (i, param_name) in param_names.iter().enumerate() {
             let param_value = new_lambda
                         .get_nth_param(i as u32)
                         .ok_or(anyhow!("Param no: {} not found on llvm function", i))?;
             let param_value = param_value.into_pointer_value();
-            self.environment.insert(param_name.clone(), param_value);
+            self.local_env.insert(param_name.clone(), param_value);
         }
 
         let body_value: Result<Vec<PointerValue>> = body.iter().map(|e| self.emit_expr(e)).collect();
@@ -640,7 +758,7 @@ impl<'ctx> CodeGen<'ctx> {
 
 
         // restore previous environment and function
-        self.environment = current_env;
+        self.local_env = current_env;
         self.current_function = current_fn;
         self.builder.position_at_end(current_block);
 
@@ -728,15 +846,13 @@ impl<'ctx> CodeGen<'ctx> {
 
 #[cfg(test)]
 mod compiler_tests {
-    use crate::codegen;
-
     use super::*;
 
 
     #[test]
     fn scalar_int_expr() {
         let ctx = Context::create();
-        let mut compiler = CodeGen::new(&ctx);
+        let mut compiler = CodeGen::new(&ctx, true);
 
         let expr = SExpr::Int(42);
 
@@ -748,7 +864,7 @@ mod compiler_tests {
     #[test]
     fn scalar_bool_expr() {
         let ctx = Context::create();
-        let mut compiler = CodeGen::new(&ctx);
+        let mut compiler = CodeGen::new(&ctx, true);
 
         // Test false - in your runtime, bools might return as 0/1
         let expr = SExpr::Bool(false);
@@ -757,7 +873,7 @@ mod compiler_tests {
         assert_eq!(result.unwrap(), 0);
 
         // Test true
-        let mut compiler2 = CodeGen::new(&ctx);
+        let mut compiler2 = CodeGen::new(&ctx, true);
         let expr = SExpr::Bool(true);
         let result = compiler2.compile_and_run(&[expr]);
         assert!(result.is_ok());
@@ -767,7 +883,7 @@ mod compiler_tests {
     #[test]
     fn integer_math() {
         let ctx = Context::create();
-        let mut compiler = CodeGen::new(&ctx);
+        let mut compiler = CodeGen::new(&ctx, true);
 
         let expr = SExpr::List(
             vec![SExpr::Symbol("+".to_string()), SExpr::Int(41), SExpr::Int(1)]
@@ -782,7 +898,7 @@ mod compiler_tests {
     #[ignore]
     fn scalar_conditional_expr() {
         let ctx = Context::create();
-        let mut compiler = CodeGen::new(&ctx);
+        let mut compiler = CodeGen::new(&ctx, true);
         let res = compiler.emit_expr(&SExpr::Bool(false));
 
         assert!(res.is_ok());
@@ -793,7 +909,7 @@ mod compiler_tests {
     fn test_jit() {
         // Create context
         let context = Context::create();
-        let mut codegen = CodeGen::new(&context);
+        let mut codegen = CodeGen::new(&context, true);
         
         // Test 1: Simple arithmetic
         // (+ 40 2)
@@ -825,8 +941,32 @@ mod compiler_tests {
         ]);
         
         // Create fresh compiler for second test
-        let mut compiler2 = CodeGen::new(&context);
+        let mut compiler2 = CodeGen::new(&context, true);
         let result =  compiler2.compile_and_run(&[expr2]).unwrap();
         assert_eq!(42, result); 
+    }
+
+    #[test]
+    fn test_repl_global_variables() {
+        // Test that global variables persist across REPL evaluations
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, false);
+
+        // First REPL line: (def x 42)
+        let def_expr = SExpr::DefExpr(
+            "x".to_string(),
+            Box::new(SExpr::Int(42))
+        );
+
+        let result1 = codegen.repl_compile(&[def_expr]);
+        assert!(result1.is_ok(), "Failed to define x: {:?}", result1.err());
+        assert_eq!(result1.unwrap(), 42);
+
+        // Second REPL line: x (should return 42)
+        let read_expr = SExpr::Symbol("x".to_string());
+
+        let result2 = codegen.repl_compile(&[read_expr]);
+        assert!(result2.is_ok(), "Failed to read x: {:?}", result2.err());
+        assert_eq!(result2.unwrap(), 42);
     }
 }
