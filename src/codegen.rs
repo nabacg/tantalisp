@@ -258,34 +258,33 @@ impl<'ctx> CodeGen<'ctx> {
     fn create_execution_engine_for_repl(&mut self) -> Result<ExecutionEngine<'ctx>> {
 
              // Clone the module so the original isn't consumed
-      let module_clone = self.module.clone();
+        let module_clone = self.module.clone();
 
-      // Create execution engine from the clone
-      let mut engine = module_clone.create_jit_execution_engine(inkwell::OptimizationLevel::None)
-          .map_err(|e| anyhow!("Failed to create JIT execution engine: {}", e))?;
+        // Create execution engine from the clone
+        let  engine = module_clone.create_jit_execution_engine(inkwell::OptimizationLevel::None)
+            .map_err(|e| anyhow!("Failed to create JIT execution engine: {}", e))?;
 
-      // Register our runtime helper functions with the JIT
-      // This tells the JIT where to find these symbols at runtime
+        // Register our runtime helper functions with the JIT
+        // This tells the JIT where to find these symbols at runtime
 
-      // Get the LLVM function declarations
-      let get_var_fn = module_clone.get_function("runtime_get_var")
-          .ok_or(anyhow!("runtime_get_var not found in module"))?;
-      let set_var_fn = module_clone.get_function("runtime_set_var")
-          .ok_or(anyhow!("runtime_set_var not found in module"))?;
+        // Get the LLVM function declarations
+        let get_var_fn = module_clone.get_function("runtime_get_var")
+            .ok_or(anyhow!("runtime_get_var not found in module"))?;
+        let set_var_fn = module_clone.get_function("runtime_set_var")
+            .ok_or(anyhow!("runtime_set_var not found in module"))?;
 
-      // Map them to the actual Rust function addresses
-      unsafe {
-          engine.add_global_mapping(
-              &get_var_fn,
-              runtime_get_var as usize
-          );
-          engine.add_global_mapping(
-              &set_var_fn,
-              runtime_set_var as usize
-          );
-      }
+        // Map them to the actual Rust function addresses
+        engine.add_global_mapping(
+        &get_var_fn,
+        runtime_get_var as usize
+        );
 
-      Ok(engine)
+        engine.add_global_mapping(
+            &set_var_fn,
+            runtime_set_var as usize
+        );  
+
+        Ok(engine)
     }
 
     pub fn compile_and_run(&mut self, exprs: &[SExpr])  -> Result<i32> {
