@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::atomic};
+use std::{collections::HashMap, ops::Add, sync::atomic};
 
 use inkwell::{builder::Builder, context::Context, execution_engine::{ExecutionEngine, JitFunction}, module::Module, types::StructType, values::{FunctionValue, GlobalValue, IntValue, PointerValue}, AddressSpace, IntPredicate};
 use anyhow::{anyhow, bail, Result};
@@ -18,8 +18,47 @@ pub fn repl_compile(ctx: &Context, exprs: &[SExpr], debug_mode: bool) -> Result<
     codegen.repl_compile(exprs)
 }
 
+//TODO - move to runtime.rs ?
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_get_var(
+    env_ptr: *mut std::ffi::c_void,
+    name_ptr: *const std::os::raw::c_char
+) -> *mut LispValLayout {
+    unsafe {
+        let env = &*(env_ptr as *mut HashMap<String, *mut LispValLayout>);
+        let name = std::ffi::CStr::from_ptr(name_ptr)
+            .to_str(); //TODO - check errors?
+        if let Ok(name) = name {
+            env.get(name).copied().unwrap_or(std::ptr::null_mut())
+
+        } else {
+            std::ptr::null_mut()
+        }
+
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_set_var(
+    env_ptr: *mut std::ffi::c_void,
+    name_ptr: *const std::os::raw::c_char,
+    value_ptr: *mut LispValLayout
+) {
+    unsafe {
+        let env = &mut *(env_ptr as *mut HashMap<String, *mut LispValLayout>);
+        let name = std::ffi::CStr::from_ptr(name_ptr)
+            .to_str(); //TODO - check errors?
+        if let Ok(name) = name {
+            env.insert(name.to_string(), value_ptr);
+
+        } 
+
+    }
+}
+
 #[repr(C)]
-struct LispValLayout {
+pub struct LispValLayout {
     tag: u8,
     _padding: [u8; 7],  // Explicit padding to align the next field to 8 bytes
     data: i64,
@@ -29,7 +68,6 @@ pub struct CodeGen<'ctx> {
     ctx: &'ctx Context,
     module: Module<'ctx>,
     builder: Builder<'ctx>,
-    execution_engine: Option<ExecutionEngine<'ctx>>,
 
     //the boxed type LispVal
     lisp_val_type: StructType<'ctx>,
@@ -48,7 +86,10 @@ pub struct CodeGen<'ctx> {
     //track function parameters during lambda compilation
     current_function: Option<FunctionValue<'ctx>>,
     // print debug info like LLVM IR
-    debug: bool
+    debug: bool,
+
+    // Runtime symbol table - use raw pointer for stable address
+    runtime_env: *mut HashMap<String, *mut LispValLayout>,
 
 }
 
@@ -100,15 +141,14 @@ impl<'ctx> CodeGen<'ctx> {
         let memcpy_fn_type = ptr_type.fn_type(&[
             ptr_type.into(), 
             ptr_type.into(),
-            ctx.i64_type().into()
+            ctx.i64_type().into() 
         ], false);
         let memcpy = module.add_function("memcpy", memcpy_fn_type, None);
 
-        Self {
+        let mut c =Self {
             ctx,
             module,
             builder,
-            execution_engine: None,
             lisp_val_type: lisp_value_type,
             malloc_fn,
             free_fn,
@@ -116,8 +156,12 @@ impl<'ctx> CodeGen<'ctx> {
             local_env: HashMap::new(),
             global_env: HashMap::new(),
             current_function: None,
+            runtime_env: Box::into_raw(Box::new(HashMap::new())),
             debug: debug_mode
-        }
+        };
+        c.declare_runtime_functions();
+
+        c
     }
 
     // compile_and_run version for REPL, doesn't create fresh execution engine each time, 
@@ -159,7 +203,7 @@ impl<'ctx> CodeGen<'ctx> {
             println!("--------------------------");
         }
 
-        let engine = self.get_or_create_execution_engine()?;
+        let engine = self.create_execution_engine_for_repl()?;
 
         unsafe {
             type MainFunc = unsafe extern "C" fn() -> *mut LispValLayout;
@@ -175,7 +219,7 @@ impl<'ctx> CodeGen<'ctx> {
             match lisp_val.tag {
                 0 => Ok(lisp_val.data as i32), // Int
                 1 => Ok(lisp_val.data as i32), // Bool
-                _ => bail!("Other LispVal types not implemented yet, found: {}", lisp_val.tag)
+                _ => bail!("Returning other LispVal types not implemented yet, found: {}", lisp_val.tag)
             }
 
         }
@@ -185,19 +229,63 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
 
+    fn declare_runtime_functions(&mut self) {
+        let ptr_type = self.ctx.ptr_type(AddressSpace::default());
+        
+        //declare fn: ptr runtime_get_var(ptr env, ptr name)
+        let get_var_type = ptr_type.fn_type(
+            &[
+                ptr_type.into(), 
+                ptr_type.into()], false);
+
+        self.module.add_function("runtime_get_var", get_var_type, None);
+
+        // declare: void runtime_set_var(ptr env, ptr name, ptr value)
+        let set_var_type = ptr_type.fn_type(&[
+            ptr_type.into(),
+            ptr_type.into(),
+            ptr_type.into()
+        ], false);
+
+        self.module.add_function("runtime_set_var", set_var_type, None);
+    }
+
     fn create_execution_engine(&mut self) -> Result<ExecutionEngine<'ctx>> {
         self.module.create_jit_execution_engine(inkwell::OptimizationLevel::None)
                 .map_err(|e| anyhow!("Failed to create JIT execution engine: {}", e))
     }
 
-    fn get_or_create_execution_engine(&mut self) -> Result<&ExecutionEngine<'ctx>> {
-        if self.execution_engine.is_none() {
-            let engine = self.module.create_jit_execution_engine(inkwell::OptimizationLevel::None)
-                .map_err(|e| anyhow!("Failed to create JIT execution engine: {}", e))?;
-            self.execution_engine = Some(engine);
-        }
+    fn create_execution_engine_for_repl(&mut self) -> Result<ExecutionEngine<'ctx>> {
 
-        Ok(self.execution_engine.as_ref().unwrap())
+             // Clone the module so the original isn't consumed
+      let module_clone = self.module.clone();
+
+      // Create execution engine from the clone
+      let mut engine = module_clone.create_jit_execution_engine(inkwell::OptimizationLevel::None)
+          .map_err(|e| anyhow!("Failed to create JIT execution engine: {}", e))?;
+
+      // Register our runtime helper functions with the JIT
+      // This tells the JIT where to find these symbols at runtime
+
+      // Get the LLVM function declarations
+      let get_var_fn = module_clone.get_function("runtime_get_var")
+          .ok_or(anyhow!("runtime_get_var not found in module"))?;
+      let set_var_fn = module_clone.get_function("runtime_set_var")
+          .ok_or(anyhow!("runtime_set_var not found in module"))?;
+
+      // Map them to the actual Rust function addresses
+      unsafe {
+          engine.add_global_mapping(
+              &get_var_fn,
+              runtime_get_var as usize
+          );
+          engine.add_global_mapping(
+              &set_var_fn,
+              runtime_set_var as usize
+          );
+      }
+
+      Ok(engine)
     }
 
     pub fn compile_and_run(&mut self, exprs: &[SExpr])  -> Result<i32> {
@@ -269,37 +357,74 @@ impl<'ctx> CodeGen<'ctx> {
                     return Ok(*val)
                 }
 
-                // then in global 
-                if let Some(global) = self.global_env.get(id) {
-                    let loaded = self.builder.build_load(
-                            self.ctx.ptr_type(
-                                AddressSpace::default()),
-                                global.as_pointer_value(), 
-                                &format!("load_{}", id))?;
-                    return Ok(loaded.into_pointer_value())
-                }
+                let ptr_type = self.ctx.ptr_type(AddressSpace::default());
 
-                bail!("Undefined variable: {}, known globals: {:?}", id, self.global_env.keys())
+                // create a pointer to Rust's self.runtime_env
+                let env_addr = self.runtime_env as u64;
+                let env_ptr = self.builder.build_int_to_ptr(
+                    self.ctx.i64_type().const_int(env_addr, false), 
+                    ptr_type,
+                        "env_ptr")?;
+                //create C string for id (var_name)
+                let name_str_val = self.ctx.const_string(id.as_bytes(), true);
+                let name_global = self.module.add_global(name_str_val.get_type(), 
+                None,
+            &format!("varname_{}", id) );
+
+                name_global.set_initializer(&name_str_val);
+
+                // Finally call runtime_get_var 
+                let get_var_fn = self.module.get_function("runtime_get_var")
+                .ok_or(anyhow!("cannot find `runtime_get_var` function"))?; // TODO - need constatns for those name
+
+                let call_site  =      self.builder.build_call(    
+                get_var_fn,     
+                &[
+                    env_ptr.into(),
+                    name_global.as_pointer_value().into()
+                ], "get_var_call")?;
+
+                let result = call_site.try_as_basic_value()
+                    .left()
+                    .ok_or(anyhow!("runtime_get_var didn't return a value for var_name: {}", id))?
+                    .into_pointer_value();
+
+                // TODO - build null check 
+                let is_null = self.builder.build_is_null(result, "is_get_var_result_null")?;
+
+
+                Ok(result)
             },
             SExpr::DefExpr(id, val_expr) => {
                 let ptr_type = self.ctx.ptr_type(AddressSpace::default());
 
                 let val_ptr = self.emit_expr(&*val_expr)?;
-                let global_var_name = format!("global_{}", id);
-                // get or create global_var
-                let global_var = self.module.add_global(ptr_type, 
-                    None, 
-                    &global_var_name);
 
-                //initialize to null (llvm requirement)    
-                global_var.set_initializer(&ptr_type.const_null());
+                // create a pointer to Rust's self.runtime_env
+                let env_addr = self.runtime_env as u64;
+                let env_ptr = self.builder.build_int_to_ptr(
+                    self.ctx.i64_type().const_int(env_addr, false), 
+                    ptr_type,
+                     "env_ptr")?;
+                //create C string for id (var_name)
+                let name_str_val = self.ctx.const_string(id.as_bytes(), true);
+                let name_global = self.module.add_global(name_str_val.get_type(), 
+                None,
+            &format!("varname_{}", id) );
 
-                // emit STORE instruction
-                self.builder.build_store(global_var.as_pointer_value(), val_ptr)?;
+                name_global.set_initializer(&name_str_val);
 
-                // insert handle to that var into global_env, so we can look it up later
-                self.global_env.insert(id.clone(), global_var);
+                // Finally call runtime_ser_var 
+                let set_var_fn = self.module.get_function("runtime_set_var")
+                    .ok_or(anyhow!("cannot find `runtime_set_var` function"))?; // TODO - need constatns for those name
 
+                self.builder.build_call(
+                    set_var_fn, 
+                    &[
+                        env_ptr.into(),
+                        name_global.as_pointer_value().into(),
+                        val_ptr.into()
+                    ], "set_var_vall")?;
                 Ok(val_ptr)
             },
             SExpr::IfExpr(pred_expr, truthy_exprs, falsy_exprs) => {
@@ -811,6 +936,15 @@ impl<'ctx> CodeGen<'ctx> {
     
 
 
+}
+
+impl<'ctx> Drop for CodeGen<'ctx> {
+    fn drop(&mut self) {
+        //Clean up the leaked runtime_env
+        unsafe {
+            let _ = Box::from_raw(self.runtime_env);
+        }
+    }
 }
 
 // tmp built ins
