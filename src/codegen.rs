@@ -12,7 +12,7 @@ pub fn compile_and_run(exprs: &[SExpr], debug_mode: bool) -> Result<i32> {
     codegen.compile_and_run(exprs)
 }
 
-pub fn repl_compile(ctx: &Context, exprs: &[SExpr], debug_mode: bool) -> Result<i32> {
+pub fn repl_compile(ctx: &Context, exprs: &[SExpr], debug_mode: bool) -> Result<String> {
     let mut codegen = CodeGen::new(ctx, debug_mode);
 
     codegen.repl_compile(exprs)
@@ -164,9 +164,9 @@ impl<'ctx> CodeGen<'ctx> {
         c
     }
 
-    // compile_and_run version for REPL, doesn't create fresh execution engine each time, 
+    // compile_and_run version for REPL, doesn't create fresh execution engine each time,
     // thus allows defining global vars and re-using them in subsequent executions
-    pub fn repl_compile(&mut self, exprs: &[SExpr]) -> Result<i32> {
+    pub fn repl_compile(&mut self, exprs: &[SExpr]) -> Result<String> {
         let ptr_type = self.ctx.ptr_type(AddressSpace::default());
 
         //Generate unique function name for each REAPL line
@@ -217,8 +217,16 @@ impl<'ctx> CodeGen<'ctx> {
             }
             let lisp_val = &*lisp_val_ptr;
             match lisp_val.tag {
-                0 => Ok(lisp_val.data as i32), // Int
-                1 => Ok(lisp_val.data as i32), // Bool
+                0 => Ok(format!("{}", lisp_val.data as i32)), // Int
+                1 => {
+                    // Bool - display as :true or :false
+                    if lisp_val.data != 0 {
+                        Ok(":true".to_string())
+                    } else {
+                        Ok(":false".to_string())
+                    }
+                },
+                5 => Ok("#<lambda>".to_string()), // Lambda
                 _ => bail!("Returning other LispVal types not implemented yet, found: {}", lisp_val.tag)
             }
 
@@ -367,8 +375,8 @@ impl<'ctx> CodeGen<'ctx> {
                 //create C string for id (var_name)
                 let name_str_val = self.ctx.const_string(id.as_bytes(), true);
                 let name_global = self.module.add_global(name_str_val.get_type(), 
-                None,
-            &format!("varname_{}", id) );
+                    None,
+                &format!("varname_{}", id) );
 
                 name_global.set_initializer(&name_str_val);
 
@@ -427,31 +435,59 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(val_ptr)
             },
             SExpr::IfExpr(pred_expr, truthy_exprs, falsy_exprs) => {
-                // let current_function = self.current_function.ok_or_else(anyhow!("Cannot codegen IfExpr with out current_function!"))?;
-                // let pred_value = self.codegen_expr(*pred_expr)?;
-                // // TODO check if Bool
-                // let truthy_vals: Result<Vec<IntValue<'ctx>>> =    truthy_exprs
-                // .iter()
-                // .map(|e| self.codegen_expr(e))
-                // .collect();
+                let current_function = self.current_function
+                    .ok_or(anyhow!("Cannot codegen IfExpr with out current_function!"))?;
+                let i32_type = self.ctx.i32_type();
+
+                //eval predicate to LispVal pointer
+                let pred_value_ptr = self.emit_expr(&*pred_expr)?;
+                // unbox value of predicate to int
+                let pred_val_bool = self.unbox_bool(pred_value_ptr)?;
+              
+
+                // create BBs for branches
+                let truthy_block = self.ctx.append_basic_block(current_function, "truthy_branch");
+                let falsy_block = self.ctx.append_basic_block(current_function, "falsy_branch");
+                let merge_block = self.ctx.append_basic_block(current_function, "merge");
+
+                self.builder.build_conditional_branch(pred_val_bool, truthy_block, falsy_block)?;
+
+                // then branch
+                self.builder.position_at_end(truthy_block);
+
+                let truthy_vals: Result<Vec<PointerValue<'ctx>>> =    truthy_exprs
+                                    .iter()
+                                    .map(|e| self.emit_expr(e))
+                                    .collect();
+                let truthy_val = truthy_vals?;                
+                let truthy_result = truthy_val.last().ok_or(anyhow!("Empty IFExpr then block!"))?;
+
+                self.builder.build_unconditional_branch(merge_block)?;
+                let truthy_bb_end = self.builder.get_insert_block().unwrap();
+
+                // else branch             
+                self.builder.position_at_end(falsy_block);
+                let falsy_vals: Result<Vec<PointerValue<'ctx>>> =    falsy_exprs
+                                                                    .iter()
+                                                                    .map(|e| self.emit_expr(e))
+                                                                    .collect();
+                let falsy_val = falsy_vals?;
+                let falsy_result = falsy_val.last().ok_or(anyhow!("Empty IfExpr else block"))?;
+                self.builder.build_unconditional_branch(merge_block)?;
+                let falsy_bb_end = self.builder.get_insert_block().unwrap();
 
 
-                // let falsy_vals: Result<Vec<IntValue<'ctx>>> =    falsy_exprs
-                // .iter()
-                // .map(|e| self.codegen_expr(e))
-                // .collect();
+                // merge with Phi node
+                self.builder.position_at_end(merge_block);
+                let phi_node = self.builder.build_phi(self.ctx.ptr_type(AddressSpace::default()), "if_phi_node")?;
 
-                // let truthy_block = self.context.append_basic_block(current_function, "truthy_branch");
+                phi_node.add_incoming(&[(truthy_result, truthy_bb_end), (falsy_result, falsy_bb_end)]);
 
-                // let falsy_block = self.context.append_basic_block(current_function, "falsy_branch");
+                // let cond_result = self.builder.build_return(Some(&phi_node.as_basic_value().into_pointer_value()))?;
+                let cond_result = phi_node.as_basic_value().into_pointer_value();
+                // self.builder.build_return(Some(&phi_node.as_basic_value().into_pointer_value()))?;
 
-                // let merge_block = self.context.append_basic_block(current_function, "merge");
-                // // TODO the PHI node 
-                // self.builder.build_conditional_branch(pred_value, truthy_block, falsy_block);
-
-                
-
-                todo!()
+                Ok(cond_result)
             },
             SExpr::LambdaExpr(params, body) => { 
                 let lambda_val = self.emit_lambda(params, body)?;
@@ -749,7 +785,7 @@ impl<'ctx> CodeGen<'ctx> {
         .into_int_value();
 
         // we still need to truncate i64 to i32
-        let value = self.builder.build_int_truncate(int_val, self.ctx.i8_type(), "trunc_i64_i8")?;
+        let value = self.builder.build_int_truncate(int_val, self.ctx.bool_type(), "trunc_i64_i8")?;
 
         Ok(value)
     }
@@ -813,28 +849,18 @@ impl<'ctx> CodeGen<'ctx> {
         if let SExpr::Symbol(op) = func {
             match op.as_str() {
                 "+" => return self.emit_add(args),
-                "*" => return self.compile_mul(args),
-                "-" => return self.compile_sub(args),
-                "/" => return self.compile_div(args),
+                "*" => return self.emit_mul(args),
+                "-" => return self.emit_sub(args),
+                "/" => return self.emit_div(args),
+                "=" => return self.emit_eq(args),
+                "!=" => return self.emit_ne(args),
+                "<" => return self.emit_lt(args),
+                ">" => return self.emit_gt(args),
+                "<=" => return self.emit_le(args),
+                ">=" => return self.emit_ge(args),
                 _ => {}
             }
         }
-
-        // if let SExpr::LambdaExpr(params, body) = func { 
-        //     let llvm_function = self.emit_lambda(params, body);
-        //     let args: Vec<_> = args.iter().map(|a| self.emit_expr(a)).collect::<Result<Vec<_>>>()?;
-
-        //     // Convert to BasicMetadataValueEnum for call
-        //     let args: Vec<_> = args.iter().map(|a| (*a).into()).collect();   
-
-        //     let call_site = self.builder.build_call(llvm_function?, &args, "lambda_call")?;
-
-        //     let result = call_site.try_as_basic_value().left().ok_or(anyhow!("Failed to get lambda_call result"));
-
-        //     let result = result?.into_pointer_value();
-
-        //     return Ok(result)
-        // }
 
         let func = self.emit_expr(func)?;
         let func_ptr = self.unbox_lambda(func)?;
@@ -932,6 +958,7 @@ impl<'ctx> CodeGen<'ctx> {
             bail!("Function verification failed")
         }
     }
+
     
 
 
@@ -963,7 +990,7 @@ impl<'ctx> CodeGen<'ctx> {
         self.box_int(result)
     }
 
-    fn compile_sub(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
+    fn emit_sub(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
         if args.len() != 2 {
             bail!("- requires exactly 2 arguments");
         }
@@ -981,7 +1008,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
 
-    fn compile_mul(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
+    fn emit_mul(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
         if args.len() != 2 {
             bail!("* requires exactly 2 arguments");
         }
@@ -999,7 +1026,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
 
-    fn compile_div(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
+    fn emit_div(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
         if args.len() != 2 {
             bail!("/ requires exactly 2 arguments");
         }
@@ -1013,6 +1040,92 @@ impl<'ctx> CodeGen<'ctx> {
 
         let result = self.builder.build_int_signed_div(arg0, arg1, "builtin_divint")?;
         self.box_int(result)
+    }
+
+        
+    fn emit_eq(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
+        if args.len() != 2 {
+            bail!("= requires exactly 2 arguments");
+        }
+        let arg0 = self.emit_expr(&args[0])?;
+        let arg1 = self.emit_expr(&args[1])?;
+
+        // TODO - how about non-int values?
+        let arg0 = self.unbox_int(arg0)?;
+        let arg1 = self.unbox_int(arg1)?;
+
+        let comp_result = self.builder.build_int_compare(IntPredicate::EQ, arg0, arg1, "int_eq")?;
+        self.box_bool(comp_result)
+    }
+
+    fn emit_ne(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
+        if args.len() != 2 {
+            bail!("!= requires exactly 2 arguments");
+        }
+        let arg0 = self.emit_expr(&args[0])?;
+        let arg1 = self.emit_expr(&args[1])?;
+
+        let arg0 = self.unbox_int(arg0)?;
+        let arg1 = self.unbox_int(arg1)?;
+
+        let comp_result = self.builder.build_int_compare(IntPredicate::NE, arg0, arg1, "int_ne")?;
+        self.box_bool(comp_result)
+    }
+
+    fn emit_lt(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
+        if args.len() != 2 {
+            bail!("< requires exactly 2 arguments");
+        }
+        let arg0 = self.emit_expr(&args[0])?;
+        let arg1 = self.emit_expr(&args[1])?;
+
+        let arg0 = self.unbox_int(arg0)?;
+        let arg1 = self.unbox_int(arg1)?;
+
+        let comp_result = self.builder.build_int_compare(IntPredicate::SLT, arg0, arg1, "int_lt")?;
+        self.box_bool(comp_result)
+    }
+
+    fn emit_gt(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
+        if args.len() != 2 {
+            bail!("> requires exactly 2 arguments");
+        }
+        let arg0 = self.emit_expr(&args[0])?;
+        let arg1 = self.emit_expr(&args[1])?;
+
+        let arg0 = self.unbox_int(arg0)?;
+        let arg1 = self.unbox_int(arg1)?;
+
+        let comp_result = self.builder.build_int_compare(IntPredicate::SGT, arg0, arg1, "int_gt")?;
+        self.box_bool(comp_result)
+    }
+
+    fn emit_le(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
+        if args.len() != 2 {
+            bail!("<= requires exactly 2 arguments");
+        }
+        let arg0 = self.emit_expr(&args[0])?;
+        let arg1 = self.emit_expr(&args[1])?;
+
+        let arg0 = self.unbox_int(arg0)?;
+        let arg1 = self.unbox_int(arg1)?;
+
+        let comp_result = self.builder.build_int_compare(IntPredicate::SLE, arg0, arg1, "int_le")?;
+        self.box_bool(comp_result)
+    }
+
+    fn emit_ge(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
+        if args.len() != 2 {
+            bail!(">= requires exactly 2 arguments");
+        }
+        let arg0 = self.emit_expr(&args[0])?;
+        let arg1 = self.emit_expr(&args[1])?;
+
+        let arg0 = self.unbox_int(arg0)?;
+        let arg1 = self.unbox_int(arg1)?;
+
+        let comp_result = self.builder.build_int_compare(IntPredicate::SGE, arg0, arg1, "int_ge")?;
+        self.box_bool(comp_result)
     }
 }
 
@@ -1079,7 +1192,7 @@ mod compiler_tests {
     }
 
     #[test]
-    fn test_jit() {
+    fn test_jit_integer_math() {
         // Create context
         let context = Context::create();
         let mut codegen = CodeGen::new(&context, true);
@@ -1133,14 +1246,234 @@ mod compiler_tests {
 
         let result1 = codegen.repl_compile(&[def_expr]);
         assert!(result1.is_ok(), "Failed to define x: {:?}", result1.err());
-        assert_eq!(result1.unwrap(), 42);
+        assert_eq!(result1.unwrap(), "42");
 
         // Second REPL line: x (should return 42)
         let read_expr = SExpr::Symbol("x".to_string());
 
         let result2 = codegen.repl_compile(&[read_expr]);
         assert!(result2.is_ok(), "Failed to read x: {:?}", result2.err());
-        assert_eq!(result2.unwrap(), 42);
+        assert_eq!(result2.unwrap(), "42");
+    }
+
+    #[test]
+    fn test_eq_operator() {
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, false);
+
+        // Test: (= 1 1) should return true (1)
+        let eq_expr = SExpr::List(vec![
+            SExpr::Symbol("=".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(1)
+        ]);
+
+        let result = codegen.repl_compile(&[eq_expr]);
+        assert!(result.is_ok(), "Failed to evaluate (= 1 1): {:?}", result.err());
+        assert_eq!(result.unwrap(), ":true", "(= 1 1) should return :true");
+
+        // Test: (= 1 2) should return false - reuse same codegen
+        let ne_expr = SExpr::List(vec![
+            SExpr::Symbol("=".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(2)
+        ]);
+
+        let result2 = codegen.repl_compile(&[ne_expr]);
+        assert!(result2.is_ok(), "Failed to evaluate (= 1 2): {:?}", result2.err());
+        assert_eq!(result2.unwrap(), ":false", "(= 1 2) should return :false");
+    }
+
+    #[test]
+    fn test_if_true_branch() {
+        // Test: (if (= 1 1) 42 1) should return 42
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, false);
+
+        let if_expr = SExpr::IfExpr(
+            Box::new(SExpr::List(vec![
+                SExpr::Symbol("=".to_string()),
+                SExpr::Int(1),
+                SExpr::Int(1)
+            ])),
+            vec![SExpr::Int(42)],
+            vec![SExpr::Int(1)]
+        );
+
+        let result = codegen.repl_compile(&[if_expr]);
+        assert!(result.is_ok(), "Failed to evaluate if: {:?}", result.err());
+        assert_eq!(result.unwrap(), "42", "(if (= 1 1) 42 1) should return 42");
+    }
+
+    #[test]
+    fn test_if_false_branch() {
+        // Test: (if (= 3 1) 1 42) should return 42
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, false);
+
+        let if_expr = SExpr::IfExpr(
+            Box::new(SExpr::List(vec![
+                SExpr::Symbol("=".to_string()),
+                SExpr::Int(3),
+                SExpr::Int(1)
+            ])),
+            vec![SExpr::Int(1)],
+            vec![SExpr::Int(42)]
+        );
+
+        let result = codegen.repl_compile(&[if_expr]);
+        assert!(result.is_ok(), "Failed to evaluate if: {:?}", result.err());
+        assert_eq!(result.unwrap(), "42", "(if (= 3 1) 1 42) should return 42");
+    }
+
+    #[test]
+    fn test_ne_operator() {
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, false);
+
+        // Test: (!= 1 2) should return true
+        let expr1 = SExpr::List(vec![
+            SExpr::Symbol("!=".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(2)
+        ]);
+        let result1 = codegen.repl_compile(&[expr1]);
+        assert!(result1.is_ok(), "Failed to evaluate (!= 1 2): {:?}", result1.err());
+        assert_eq!(result1.unwrap(), ":true", "(!= 1 2) should return :true");
+
+        // Test: (!= 1 1) should return false
+        let expr2 = SExpr::List(vec![
+            SExpr::Symbol("!=".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(1)
+        ]);
+        let result2 = codegen.repl_compile(&[expr2]);
+        assert!(result2.is_ok(), "Failed to evaluate (!= 1 1): {:?}", result2.err());
+        assert_eq!(result2.unwrap(), ":false", "(!= 1 1) should return :false");
+    }
+
+    #[test]
+    fn test_lt_operator() {
+        let context = Context::create();
+
+        // Test: (< 1 2) should return true (1)
+        let mut codegen = CodeGen::new(&context, false);
+        let expr1 = SExpr::List(vec![
+            SExpr::Symbol("<".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(2)
+        ]);
+        let result1 = codegen.repl_compile(&[expr1]);
+        assert!(result1.is_ok(), "Failed to evaluate (< 1 2): {:?}", result1.err());
+        assert_eq!(result1.unwrap(), ":true", "(< 1 2) should return 1 (true)");
+
+        // Test: (< 2 1) should return false (0)
+        let expr2 = SExpr::List(vec![
+            SExpr::Symbol("<".to_string()),
+            SExpr::Int(2),
+            SExpr::Int(1)
+        ]);
+        let result2 = codegen.repl_compile(&[expr2]);
+        assert!(result2.is_ok(), "Failed to evaluate (< 2 1): {:?}", result2.err());
+        assert_eq!(result2.unwrap(), ":false", "(< 2 1) should return 0 (false)");
+    }
+
+    #[test]
+    fn test_gt_operator() {
+        let context = Context::create();
+
+        // Test: (> 2 1) should return true (1)
+        let mut codegen = CodeGen::new(&context, false);
+        let expr1 = SExpr::List(vec![
+            SExpr::Symbol(">".to_string()),
+            SExpr::Int(2),
+            SExpr::Int(1)
+        ]);
+        let result1 = codegen.repl_compile(&[expr1]);
+        assert!(result1.is_ok(), "Failed to evaluate (> 2 1): {:?}", result1.err());
+        assert_eq!(result1.unwrap(), ":true", "(> 2 1) should return 1 (true)");
+
+        // Test: (> 1 2) should return false (0)
+        let expr2 = SExpr::List(vec![
+            SExpr::Symbol(">".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(2)
+        ]);
+        let result2 = codegen.repl_compile(&[expr2]);
+        assert!(result2.is_ok(), "Failed to evaluate (> 1 2): {:?}", result2.err());
+        assert_eq!(result2.unwrap(), ":false", "(> 1 2) should return 0 (false)");
+    }
+
+    #[test]
+    fn test_le_operator() {
+        let context = Context::create();
+
+        // Test: (<= 1 2) should return true (1)
+        let mut codegen = CodeGen::new(&context, false);
+        let expr1 = SExpr::List(vec![
+            SExpr::Symbol("<=".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(2)
+        ]);
+        let result1 = codegen.repl_compile(&[expr1]);
+        assert!(result1.is_ok(), "Failed to evaluate (<= 1 2): {:?}", result1.err());
+        assert_eq!(result1.unwrap(), ":true", "(<= 1 2) should return 1 (true)");
+
+        // Test: (<= 2 2) should return true (1)
+        let expr2 = SExpr::List(vec![
+            SExpr::Symbol("<=".to_string()),
+            SExpr::Int(2),
+            SExpr::Int(2)
+        ]);
+        let result2 = codegen.repl_compile(&[expr2]);
+        assert!(result2.is_ok(), "Failed to evaluate (<= 2 2): {:?}", result2.err());
+        assert_eq!(result2.unwrap(), ":true", "(<= 2 2) should return 1 (true)");
+
+        // Test: (<= 2 1) should return false (0)
+        let expr3 = SExpr::List(vec![
+            SExpr::Symbol("<=".to_string()),
+            SExpr::Int(2),
+            SExpr::Int(1)
+        ]);
+        let result3 = codegen.repl_compile(&[expr3]);
+        assert!(result3.is_ok(), "Failed to evaluate (<= 2 1): {:?}", result3.err());
+        assert_eq!(result3.unwrap(), ":false", "(<= 2 1) should return 0 (false)");
+    }
+
+    #[test]
+    fn test_ge_operator() {
+        let context = Context::create();
+
+        // Test: (>= 2 1) should return true (1)
+        let mut codegen = CodeGen::new(&context, false);
+        let expr1 = SExpr::List(vec![
+            SExpr::Symbol(">=".to_string()),
+            SExpr::Int(2),
+            SExpr::Int(1)
+        ]);
+        let result1 = codegen.repl_compile(&[expr1]);
+        assert!(result1.is_ok(), "Failed to evaluate (>= 2 1): {:?}", result1.err());
+        assert_eq!(result1.unwrap(), ":true", "(>= 2 1) should return 1 (true)");
+
+        // Test: (>= 2 2) should return true (1)
+        let expr2 = SExpr::List(vec![
+            SExpr::Symbol(">=".to_string()),
+            SExpr::Int(2),
+            SExpr::Int(2)
+        ]);
+        let result2 = codegen.repl_compile(&[expr2]);
+        assert!(result2.is_ok(), "Failed to evaluate (>= 2 2): {:?}", result2.err());
+        assert_eq!(result2.unwrap(), ":true", "(>= 2 2) should return 1 (true)");
+
+        // Test: (>= 1 2) should return false (0)
+        let expr3 = SExpr::List(vec![
+            SExpr::Symbol(">=".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(2)
+        ]);
+        let result3 = codegen.repl_compile(&[expr3]);
+        assert!(result3.is_ok(), "Failed to evaluate (>= 1 2): {:?}", result3.err());
+        assert_eq!(result3.unwrap(), ":false", "(>= 1 2) should return 0 (false)");
     }
 
     #[test]
@@ -1182,7 +1515,94 @@ mod compiler_tests {
 
         let result1 = codegen.repl_compile(&[def_x, def_f, call_expr]);
         assert!(result1.is_ok(), "Failed to define x: {:?}", result1.err());
-        assert_eq!(result1.unwrap(), 420);
+        assert_eq!(result1.unwrap(), "420");
 
+    }
+
+    #[test]
+    fn test_fibonacci_recursive() {
+        // Test: (def fib (fn [x] (if (< x 1) 1 (+ (fib (- x 1)) (fib (- x 2))))))
+        // Then test fib(1), fib(2), fib(5), fib(10)
+        // Expected: 1, 2, 8, 89
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, false);
+
+        // Define the fibonacci function
+        // (def fib (fn [x] (if (<= x 1) 1 (+ (fib (- x 1)) (fib (- x 2))))))
+        let fib_lambda = SExpr::LambdaExpr(
+            vec![SExpr::Symbol("x".to_string())],
+            vec![SExpr::IfExpr(
+                Box::new(SExpr::List(vec![
+                    SExpr::Symbol("<=".to_string()),
+                    SExpr::Symbol("x".to_string()),
+                    SExpr::Int(1),
+                ])),
+                vec![SExpr::Int(1)],
+                vec![SExpr::List(vec![
+                    SExpr::Symbol("+".to_string()),
+                    SExpr::List(vec![
+                        SExpr::Symbol("fib".to_string()),
+                        SExpr::List(vec![
+                            SExpr::Symbol("-".to_string()),
+                            SExpr::Symbol("x".to_string()),
+                            SExpr::Int(1),
+                        ])
+                    ]),
+                    SExpr::List(vec![
+                        SExpr::Symbol("fib".to_string()),
+                        SExpr::List(vec![
+                            SExpr::Symbol("-".to_string()),
+                            SExpr::Symbol("x".to_string()),
+                            SExpr::Int(2),
+                        ])
+                    ]),
+                ])]
+            )]
+        );
+
+        let def_fib = SExpr::DefExpr(
+            "fib".to_string(),
+            Box::new(fib_lambda)
+        );
+
+        // Define fib first
+        let result = codegen.repl_compile(&[def_fib]);
+        assert!(result.is_ok(), "Failed to define fib: {:?}", result.err());
+
+        // Test fib(1) = 1
+        let call_fib_1 = SExpr::List(vec![
+            SExpr::Symbol("fib".to_string()),
+            SExpr::Int(1),
+        ]);
+        let result1 = codegen.repl_compile(&[call_fib_1]);
+        assert!(result1.is_ok(), "Failed to evaluate fib(1): {:?}", result1.err());
+        assert_eq!(result1.unwrap(), "1", "fib(1) should return 1");
+
+        // Test fib(2) = 2
+        let call_fib_2 = SExpr::List(vec![
+            SExpr::Symbol("fib".to_string()),
+            SExpr::Int(2),
+        ]);
+        let result2 = codegen.repl_compile(&[call_fib_2]);
+        assert!(result2.is_ok(), "Failed to evaluate fib(2): {:?}", result2.err());
+        assert_eq!(result2.unwrap(), "2", "fib(2) should return 2");
+
+        // Test fib(5) = 8
+        let call_fib_5 = SExpr::List(vec![
+            SExpr::Symbol("fib".to_string()),
+            SExpr::Int(5),
+        ]);
+        let result5 = codegen.repl_compile(&[call_fib_5]);
+        assert!(result5.is_ok(), "Failed to evaluate fib(5): {:?}", result5.err());
+        assert_eq!(result5.unwrap(), "8", "fib(5) should return 8");
+
+        // Test fib(10) = 89
+        let call_fib_10 = SExpr::List(vec![
+            SExpr::Symbol("fib".to_string()),
+            SExpr::Int(10),
+        ]);
+        let result10 = codegen.repl_compile(&[call_fib_10]);
+        assert!(result10.is_ok(), "Failed to evaluate fib(10): {:?}", result10.err());
+        assert_eq!(result10.unwrap(), "89", "fib(10) should return 89");
     }
 }
