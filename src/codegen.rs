@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Pointer, sync::atomic};
+use std::{collections::HashMap, fmt::Pointer, ops::Add, slice, sync::atomic};
 
 use inkwell::{builder::Builder, context::Context, execution_engine::{ExecutionEngine, JitFunction}, module::Module, types::StructType, values::{FunctionValue, GlobalValue, IntValue, PointerValue}, AddressSpace, IntPredicate};
 use anyhow::{anyhow, bail, Result};
@@ -12,7 +12,7 @@ pub fn compile_and_run(exprs: &[SExpr], debug_mode: bool) -> Result<i32> {
     codegen.compile_and_run(exprs)
 }
 
-pub fn repl_compile(ctx: &Context, exprs: &[SExpr], debug_mode: bool) -> Result<i32> {
+pub fn repl_compile_and_run(ctx: &Context, exprs: &[SExpr], debug_mode: bool) -> Result<String> {
     let mut codegen = CodeGen::new(ctx, debug_mode);
 
     codegen.repl_compile(exprs)
@@ -64,6 +64,12 @@ pub struct LispValLayout {
     data: i64,
 }
 
+#[repr(C)]
+pub struct ConsCellLayout {
+    head: *mut LispValLayout,  
+    tail: *mut ConsCellLayout,
+}
+
 pub struct CodeGen<'ctx> {
     ctx: &'ctx Context,
     module: Module<'ctx>,
@@ -71,6 +77,9 @@ pub struct CodeGen<'ctx> {
 
     //the boxed type LispVal
     lisp_val_type: StructType<'ctx>,
+
+    //Cons cell type for constructing lisp lists
+    cons_cell_type: StructType<'ctx>,
 
     //necessary Runtime functions (malloc, free, etc.)
     malloc_fn: FunctionValue<'ctx>,
@@ -116,10 +125,16 @@ impl<'ctx> CodeGen<'ctx> {
         // │ }               │
         // └─────────────────┘
 
-        let lisp_value_type = ctx.opaque_struct_type("LispVal");
-        lisp_value_type.set_body(&[
+        let lisp_val_type = ctx.opaque_struct_type("LispVal");
+        lisp_val_type.set_body(&[
             ctx.i8_type().into(), // tag
             ctx.i64_type().into() // union { i32, bool, ptr(String), ptr(List)}
+        ], false);
+
+        let cons_cell_type = ctx.opaque_struct_type("ConsCell");
+        cons_cell_type.set_body(&[
+            ctx.i64_type().into(),
+            ctx.i64_type().into()
         ], false);
 
         // Ptr type
@@ -146,7 +161,8 @@ impl<'ctx> CodeGen<'ctx> {
             ctx,
             module,
             builder,
-            lisp_val_type: lisp_value_type,
+            lisp_val_type,
+            cons_cell_type,
             malloc_fn,
             free_fn,
             memcpy_fn: memcpy,
@@ -160,9 +176,9 @@ impl<'ctx> CodeGen<'ctx> {
         c
     }
 
-    // compile_and_run version for REPL, doesn't create fresh execution engine each time, 
+    // compile_and_run version for REPL, doesn't create fresh execution engine each time,
     // thus allows defining global vars and re-using them in subsequent executions
-    pub fn repl_compile(&mut self, exprs: &[SExpr]) -> Result<i32> {
+    pub fn repl_compile(&mut self, exprs: &[SExpr]) -> Result<String> {
         let ptr_type = self.ctx.ptr_type(AddressSpace::default());
 
         //Generate unique function name for each REAPL line
@@ -211,12 +227,7 @@ impl<'ctx> CodeGen<'ctx> {
             if lisp_val_ptr.is_null() {
                 bail!("JIT returned null pointer");
             }
-            let lisp_val = &*lisp_val_ptr;
-            match lisp_val.tag {
-                0 => Ok(lisp_val.data as i32), // Int
-                1 => Ok(lisp_val.data as i32), // Bool
-                _ => bail!("Returning other LispVal types not implemented yet, found: {}", lisp_val.tag)
-            }
+            lisp_val_to_string(lisp_val_ptr)
 
         }
      
@@ -359,7 +370,9 @@ impl<'ctx> CodeGen<'ctx> {
             SExpr::List(sexprs) => self.emit_call(&sexprs),
             SExpr::Vector(sexprs) => todo!(),
             SExpr::BuiltinFn(_, _) => todo!(),
-            SExpr::Quoted(sexpr) => todo!()
+            SExpr::Quoted(sexpr) => {
+                self.emit_list(slice::from_ref(sexpr.as_ref()))
+            },
         }
     }
 
@@ -485,21 +498,28 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
     }
 
 
-    //Allocate a LispVal on the heap and return a pointer to it
-    fn alloc_lisp_val(&self) -> Result<PointerValue<'ctx>> {
-        let size = self.lisp_val_type.size_of().ok_or(anyhow!("Failed to get LispVal size!"))?;
-
-        //Call malloc
+    fn call_malloc(&self, size: IntValue<'ctx>) -> Result<PointerValue<'ctx>> {
         let ptr = self.builder
         .build_call(self.malloc_fn, &[size.into()], "malloc")?.try_as_basic_value()
         .left().ok_or(anyhow!("Failed to call malloc"))?;
 
-        let lisp_val_ptr = self.builder
+        let val_ptr = self.builder
             .build_pointer_cast(ptr.into_pointer_value(), 
                 self.ctx.ptr_type(AddressSpace::default()), 
-                "cast_to_lisp_value")?;
+                "cast_to_ptr")?;
 
-         Ok(lisp_val_ptr)       
+         Ok(val_ptr)   
+    }
+
+    //Allocate a LispVal on the heap and return a pointer to it
+    fn alloc_lisp_val(&self) -> Result<PointerValue<'ctx>> {
+        let size = self.lisp_val_type.size_of().ok_or(anyhow!("Failed to get LispVal size!"))?;
+        self.call_malloc(size)     
+    }
+
+    fn alloc_cons_cell(&self) -> Result<PointerValue<'ctx>>  { 
+        let size = self.cons_cell_type.size_of().ok_or(anyhow!("Failed to get ConsCell size!"))?;
+        self.call_malloc(size)
     }
 
     fn box_int(&mut self, value: IntValue<'ctx>) -> Result<PointerValue<'ctx>> {
@@ -564,12 +584,14 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         let str_len = value.len() + 1; //+1 for null
         let str_size = self.ctx.i64_type().const_int(str_len as u64, false);
 
-        let str_ptr = self.builder
-            .build_call(self.malloc_fn, &[str_size.into()], "malloc_str")?
-            .try_as_basic_value()
-            .left()
-            .ok_or(anyhow!("Failed to malloc for string value"))?
-            .into_pointer_value();
+        // let str_ptr = self.builder
+        //     .build_call(self.malloc_fn, &[str_size.into()], "malloc_str")?
+        //     .try_as_basic_value()
+        //     .left()
+        //     .ok_or(anyhow!("Failed to malloc for string value"))?
+        //     .into_pointer_value();
+
+        let str_ptr = self.call_malloc(str_size)?;
 
         // Create a global constant for the source string, as it will come from literal values in source code (list "a" )
         // This creates a read-only string in the data section
@@ -604,11 +626,48 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
     fn box_nil(&mut self) -> Result<PointerValue<'ctx>> {
         let new_lisp_val_ptr = self.alloc_lisp_val()?;
 
-        // write STRING_TAG 
-        let tag_ptr = self.builder.build_struct_gep(self.lisp_val_type, new_lisp_val_ptr, 0, "tag_ptr")?;
+        // write NIL_TAG 
+        let tag_ptr = self.builder.build_struct_gep(self.lisp_val_type, 
+            new_lisp_val_ptr, 0, "tag_ptr")?;
         let tag = self.ctx.i8_type().const_int(TAG_NIL as u64, false);
         self.builder.build_store(tag_ptr, tag)?;
 
+
+        Ok(new_lisp_val_ptr)
+    }
+
+    fn box_list(&mut self, exprs: &[PointerValue<'ctx>]) -> Result<PointerValue<'ctx>> {
+        let new_lisp_val_ptr = self.alloc_lisp_val()?;
+
+        // write LIST_TAG 
+        let tag_ptr = self.builder.build_struct_gep(self.lisp_val_type, 
+            new_lisp_val_ptr, 0, "tag_ptr")?;
+        let tag = self.ctx.i8_type().const_int(TAG_LIST as u64, false);
+        self.builder.build_store(tag_ptr, tag)?;
+
+
+
+        let mut current_head = self.alloc_cons_cell()?;
+        let list_head_ptr = current_head.clone(); // keep the original head of the list in place for returning
+        for e in exprs {
+            let head_ptr = self.builder.build_struct_gep(self.cons_cell_type, current_head, 0, "cons_head_ptr")?;
+            self.builder.build_store(head_ptr, *e)?;
+
+            let tail_ptr = self.builder.build_struct_gep(self.cons_cell_type, current_head, 1, "tail_ptr")?;
+            let next_elem = self.alloc_cons_cell()?;
+            self.builder.build_store(tail_ptr, next_elem)?;
+
+            current_head = next_elem;
+        }
+
+        let nil_terminator = self.ctx.ptr_type(AddressSpace::default()).const_null();
+
+        let tail_ptr = self.builder.build_struct_gep(self.cons_cell_type, current_head, 1, "tail_ptr")?;
+        self.builder.build_store(tail_ptr, nil_terminator)?;
+
+
+        let data_ptr = self.builder.build_struct_gep(self.lisp_val_type, new_lisp_val_ptr, 1, "data_ptr")?;
+        self.builder.build_store(data_ptr, list_head_ptr)?;
 
         Ok(new_lisp_val_ptr)
     }
@@ -860,7 +919,8 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         let func = &args.get(0);
         if let Some(SExpr::Symbol(op)) = func {
             match op.as_str() {
-                "+" |  "*" |  "/" | "=" |"!=" | "<" | ">" | "<=" | ">=" =>  true,
+                "+" | "-" | "*" | "/" | "=" | "!=" | "<" | ">" | "<=" | ">=" => true,
+                "list" | "cons" | "head" | "tail"  => true,
                 _ => false
             }
         } else {
@@ -883,6 +943,7 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
                 ">" =>  self.emit_gt(args),
                 "<=" =>  self.emit_le(args),
                 ">=" =>  self.emit_ge(args),
+                "list" => self.emit_list(args),
                 _ => bail!("Unsupported builtin proc provided, unknown op: {}", op)
             }
         } else {
@@ -962,10 +1023,58 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
             bail!("Function verification failed")
         }
     }
+    
+    fn emit_list(&mut self, sexpr: &[SExpr]) -> Result<PointerValue<'ctx>> {
+        let elements: Result<Vec<PointerValue<'ctx>>> =  sexpr.iter()
+            .map(|e| self.emit_expr(e))
+            .collect();
+
+        let elements = elements?;
+        self.box_list(&elements)
+    }
 
     
 
 
+}
+
+#[cfg(target_pointer_width = "64")]
+fn cons_cell_ptr_from_data_ptr(addr: i64) -> *mut ConsCellLayout {
+    let addr: usize  = addr as u64 as usize;
+    addr as *mut ConsCellLayout
+}
+
+fn lisp_val_to_string(lisp_val_ptr: *mut LispValLayout) -> Result<String> {
+    let lisp_val = unsafe { &*lisp_val_ptr };
+    match lisp_val.tag {
+        0 => Ok(format!("{}", lisp_val.data as i32)), // Int
+        1 => {
+            // Bool - display as :true or :false
+            if lisp_val.data != 0 {
+                Ok(":true".to_string())
+            } else {
+                Ok(":false".to_string())
+            }
+        },
+        3 => {
+            // TODO write a Rust Iterator impl for this !!
+            let cons_cell = cons_cell_ptr_from_data_ptr(lisp_val.data);
+            let mut cons_cell_ref = unsafe { &*cons_cell};
+            let mut list_contents = vec![];
+            while !cons_cell_ref.tail.is_null() {
+        
+                let current_str = lisp_val_to_string(cons_cell_ref.head)?;
+                list_contents.push(current_str);
+
+                cons_cell_ref = unsafe { &*cons_cell_ref.tail};
+            }
+
+            Ok(format!("({})", list_contents.join(" ")))
+        }
+        5 => Ok("#<lambda>".to_string()), // Lambda
+
+        _ => bail!("Returning other LispVal types not implemented yet, found: {}", lisp_val.tag)
+    }
 }
 
 impl<'ctx> Drop for CodeGen<'ctx> {
@@ -1142,6 +1251,22 @@ mod codegen_tests {
     const DEBUG_MODE: bool = false;
 
     #[test]
+    fn list_fn() {
+        let ctx = Context::create();
+        let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
+
+        let expr = SExpr::List(vec![
+            SExpr::Symbol("list".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(2)
+        ]);
+
+        let result = compiler.repl_compile(&[expr]);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "(1 2)");
+    }
+
+    #[test]
     fn scalar_int_expr() {
         let ctx = Context::create();
         let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
@@ -1252,14 +1377,14 @@ mod codegen_tests {
 
         let result1 = codegen.repl_compile(&[def_expr]);
         assert!(result1.is_ok(), "Failed to define x: {:?}", result1.err());
-        assert_eq!(result1.unwrap(), 42);
+        assert_eq!(result1.unwrap(), "42");
 
         // Second REPL line: x (should return 42)
         let read_expr = SExpr::Symbol("x".to_string());
 
         let result2 = codegen.repl_compile(&[read_expr]);
         assert!(result2.is_ok(), "Failed to read x: {:?}", result2.err());
-        assert_eq!(result2.unwrap(), 42);
+        assert_eq!(result2.unwrap(), "42");
     }
 
     #[test]
@@ -1276,7 +1401,7 @@ mod codegen_tests {
 
         let result = codegen.repl_compile(&[eq_expr]);
         assert!(result.is_ok(), "Failed to evaluate (= 1 1): {:?}", result.err());
-        assert_eq!(result.unwrap(), 1, "(= 1 1) should return 1 (true)");
+        assert_eq!(result.unwrap(), ":true", "(= 1 1) should return 1 (true)");
 
         // Test: (= 1 2) should return false (0)
         let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
@@ -1288,7 +1413,7 @@ mod codegen_tests {
 
         let result2 = codegen2.repl_compile(&[ne_expr]);
         assert!(result2.is_ok(), "Failed to evaluate (= 1 2): {:?}", result2.err());
-        assert_eq!(result2.unwrap(), 0, "(= 1 2) should return 0 (false)");
+        assert_eq!(result2.unwrap(), ":false", "(= 1 2) should return 0 (false)");
     }
 
     #[test]
@@ -1309,7 +1434,7 @@ mod codegen_tests {
 
         let result = codegen.repl_compile(&[if_expr]);
         assert!(result.is_ok(), "Failed to evaluate if: {:?}", result.err());
-        assert_eq!(result.unwrap(), 42, "(if (= 1 1) 42 1) should return 42");
+        assert_eq!(result.unwrap(), "42", "(if (= 1 1) 42 1) should return 42");
     }
 
     #[test]
@@ -1330,7 +1455,7 @@ mod codegen_tests {
 
         let result = codegen.repl_compile(&[if_expr]);
         assert!(result.is_ok(), "Failed to evaluate if: {:?}", result.err());
-        assert_eq!(result.unwrap(), 42, "(if (= 3 1) 1 42) should return 42");
+        assert_eq!(result.unwrap(), "42", "(if (= 3 1) 1 42) should return 42");
     }
 
     #[test]
@@ -1346,7 +1471,7 @@ mod codegen_tests {
         ]);
         let result1 = codegen1.repl_compile(&[expr1]);
         assert!(result1.is_ok(), "Failed to evaluate (!= 1 2): {:?}", result1.err());
-        assert_eq!(result1.unwrap(), 1, "(!= 1 2) should return 1 (true)");
+        assert_eq!(result1.unwrap(), ":true", "(!= 1 2) should return 1 (true)");
 
         // Test: (!= 1 1) should return false (0)
         let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
@@ -1357,7 +1482,7 @@ mod codegen_tests {
         ]);
         let result2 = codegen2.repl_compile(&[expr2]);
         assert!(result2.is_ok(), "Failed to evaluate (!= 1 1): {:?}", result2.err());
-        assert_eq!(result2.unwrap(), 0, "(!= 1 1) should return 0 (false)");
+        assert_eq!(result2.unwrap(), ":false", "(!= 1 1) should return 0 (false)");
     }
 
     #[test]
@@ -1373,7 +1498,7 @@ mod codegen_tests {
         ]);
         let result1 = codegen1.repl_compile(&[expr1]);
         assert!(result1.is_ok(), "Failed to evaluate (< 1 2): {:?}", result1.err());
-        assert_eq!(result1.unwrap(), 1, "(< 1 2) should return 1 (true)");
+        assert_eq!(result1.unwrap(), ":true", "(< 1 2) should return 1 (true)");
 
         // Test: (< 2 1) should return false (0)
         let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
@@ -1384,7 +1509,7 @@ mod codegen_tests {
         ]);
         let result2 = codegen2.repl_compile(&[expr2]);
         assert!(result2.is_ok(), "Failed to evaluate (< 2 1): {:?}", result2.err());
-        assert_eq!(result2.unwrap(), 0, "(< 2 1) should return 0 (false)");
+        assert_eq!(result2.unwrap(), ":false", "(< 2 1) should return 0 (false)");
     }
 
     #[test]
@@ -1400,7 +1525,7 @@ mod codegen_tests {
         ]);
         let result1 = codegen1.repl_compile(&[expr1]);
         assert!(result1.is_ok(), "Failed to evaluate (> 2 1): {:?}", result1.err());
-        assert_eq!(result1.unwrap(), 1, "(> 2 1) should return 1 (true)");
+        assert_eq!(result1.unwrap(), ":true", "(> 2 1) should return 1 (true)");
 
         // Test: (> 1 2) should return false (0)
         let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
@@ -1411,7 +1536,7 @@ mod codegen_tests {
         ]);
         let result2 = codegen2.repl_compile(&[expr2]);
         assert!(result2.is_ok(), "Failed to evaluate (> 1 2): {:?}", result2.err());
-        assert_eq!(result2.unwrap(), 0, "(> 1 2) should return 0 (false)");
+        assert_eq!(result2.unwrap(), ":false", "(> 1 2) should return 0 (false)");
     }
 
     #[test]
@@ -1427,7 +1552,7 @@ mod codegen_tests {
         ]);
         let result1 = codegen1.repl_compile(&[expr1]);
         assert!(result1.is_ok(), "Failed to evaluate (<= 1 2): {:?}", result1.err());
-        assert_eq!(result1.unwrap(), 1, "(<= 1 2) should return 1 (true)");
+        assert_eq!(result1.unwrap(), ":true", "(<= 1 2) should return 1 (true)");
 
         // Test: (<= 2 2) should return true (1)
         let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
@@ -1438,7 +1563,7 @@ mod codegen_tests {
         ]);
         let result2 = codegen2.repl_compile(&[expr2]);
         assert!(result2.is_ok(), "Failed to evaluate (<= 2 2): {:?}", result2.err());
-        assert_eq!(result2.unwrap(), 1, "(<= 2 2) should return 1 (true)");
+        assert_eq!(result2.unwrap(), ":true", "(<= 2 2) should return 1 (true)");
 
         // Test: (<= 2 1) should return false (0)
         let mut codegen3 = CodeGen::new(&context, DEBUG_MODE);
@@ -1449,7 +1574,7 @@ mod codegen_tests {
         ]);
         let result3 = codegen3.repl_compile(&[expr3]);
         assert!(result3.is_ok(), "Failed to evaluate (<= 2 1): {:?}", result3.err());
-        assert_eq!(result3.unwrap(), 0, "(<= 2 1) should return 0 (false)");
+        assert_eq!(result3.unwrap(), ":false", "(<= 2 1) should return 0 (false)");
     }
 
     #[test]
@@ -1465,7 +1590,7 @@ mod codegen_tests {
         ]);
         let result1 = codegen1.repl_compile(&[expr1]);
         assert!(result1.is_ok(), "Failed to evaluate (>= 2 1): {:?}", result1.err());
-        assert_eq!(result1.unwrap(), 1, "(>= 2 1) should return 1 (true)");
+        assert_eq!(result1.unwrap(), ":true", "(>= 2 1) should return 1 (true)");
 
         // Test: (>= 2 2) should return true (1)
         let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
@@ -1476,7 +1601,7 @@ mod codegen_tests {
         ]);
         let result2 = codegen2.repl_compile(&[expr2]);
         assert!(result2.is_ok(), "Failed to evaluate (>= 2 2): {:?}", result2.err());
-        assert_eq!(result2.unwrap(), 1, "(>= 2 2) should return 1 (true)");
+        assert_eq!(result2.unwrap(), ":true", "(>= 2 2) should return 1 (true)");
 
         // Test: (>= 1 2) should return false (0)
         let mut codegen3 = CodeGen::new(&context, DEBUG_MODE);
@@ -1487,7 +1612,7 @@ mod codegen_tests {
         ]);
         let result3 = codegen3.repl_compile(&[expr3]);
         assert!(result3.is_ok(), "Failed to evaluate (>= 1 2): {:?}", result3.err());
-        assert_eq!(result3.unwrap(), 0, "(>= 1 2) should return 0 (false)");
+        assert_eq!(result3.unwrap(), ":false", "(>= 1 2) should return 0 (false)");
     }
 
     #[test]
@@ -1529,7 +1654,94 @@ mod codegen_tests {
 
         let result1 = codegen.repl_compile(&[def_x, def_f, call_expr]);
         assert!(result1.is_ok(), "Failed to define x: {:?}", result1.err());
-        assert_eq!(result1.unwrap(), 420);
+        assert_eq!(result1.unwrap(), "420");
 
+    }
+
+    #[test]
+    fn test_fibonacci_recursive() {
+        // Test: (def fib (fn [x] (if (<= x 1) 1 (+ (fib (- x 1)) (fib (- x 2))))))
+        // Then test fib(1), fib(2), fib(5), fib(10)
+        // Expected: 1, 2, 8, 89
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
+
+        // Define the fibonacci function
+        // (def fib (fn [x] (if (<= x 1) 1 (+ (fib (- x 1)) (fib (- x 2))))))
+        let fib_lambda = SExpr::LambdaExpr(
+            vec![SExpr::Symbol("x".to_string())],
+            vec![SExpr::IfExpr(
+                Box::new(SExpr::List(vec![
+                    SExpr::Symbol("<=".to_string()),
+                    SExpr::Symbol("x".to_string()),
+                    SExpr::Int(1),
+                ])),
+                vec![SExpr::Int(1)],
+                vec![SExpr::List(vec![
+                    SExpr::Symbol("+".to_string()),
+                    SExpr::List(vec![
+                        SExpr::Symbol("fib".to_string()),
+                        SExpr::List(vec![
+                            SExpr::Symbol("-".to_string()),
+                            SExpr::Symbol("x".to_string()),
+                            SExpr::Int(1),
+                        ])
+                    ]),
+                    SExpr::List(vec![
+                        SExpr::Symbol("fib".to_string()),
+                        SExpr::List(vec![
+                            SExpr::Symbol("-".to_string()),
+                            SExpr::Symbol("x".to_string()),
+                            SExpr::Int(2),
+                        ])
+                    ]),
+                ])]
+            )]
+        );
+
+        let def_fib = SExpr::DefExpr(
+            "fib".to_string(),
+            Box::new(fib_lambda)
+        );
+
+        // Define fib first
+        let result = codegen.repl_compile(&[def_fib]);
+        assert!(result.is_ok(), "Failed to define fib: {:?}", result.err());
+
+        // Test fib(1) = 1
+        let call_fib_1 = SExpr::List(vec![
+            SExpr::Symbol("fib".to_string()),
+            SExpr::Int(1),
+        ]);
+        let result1 = codegen.repl_compile(&[call_fib_1]);
+        assert!(result1.is_ok(), "Failed to evaluate fib(1): {:?}", result1.err());
+        assert_eq!(result1.unwrap(), "1", "fib(1) should return 1");
+
+        // Test fib(2) = 2
+        let call_fib_2 = SExpr::List(vec![
+            SExpr::Symbol("fib".to_string()),
+            SExpr::Int(2),
+        ]);
+        let result2 = codegen.repl_compile(&[call_fib_2]);
+        assert!(result2.is_ok(), "Failed to evaluate fib(2): {:?}", result2.err());
+        assert_eq!(result2.unwrap(), "2", "fib(2) should return 2");
+
+        // Test fib(5) = 8
+        let call_fib_5 = SExpr::List(vec![
+            SExpr::Symbol("fib".to_string()),
+            SExpr::Int(5),
+        ]);
+        let result5 = codegen.repl_compile(&[call_fib_5]);
+        assert!(result5.is_ok(), "Failed to evaluate fib(5): {:?}", result5.err());
+        assert_eq!(result5.unwrap(), "8", "fib(5) should return 8");
+
+        // Test fib(10) = 89
+        let call_fib_10 = SExpr::List(vec![
+            SExpr::Symbol("fib".to_string()),
+            SExpr::Int(10),
+        ]);
+        let result10 = codegen.repl_compile(&[call_fib_10]);
+        assert!(result10.is_ok(), "Failed to evaluate fib(10): {:?}", result10.err());
+        assert_eq!(result10.unwrap(), "89", "fib(10) should return 89");
     }
 }
