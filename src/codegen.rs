@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::atomic};
+use std::{collections::HashMap, fmt::Pointer, sync::atomic};
 
 use inkwell::{builder::Builder, context::Context, execution_engine::{ExecutionEngine, JitFunction}, module::Module, types::StructType, values::{FunctionValue, GlobalValue, IntValue, PointerValue}, AddressSpace, IntPredicate};
 use anyhow::{anyhow, bail, Result};
@@ -97,8 +97,8 @@ const TAG_LIST: u8 = 3;
 const TAG_NIL: u8 = 4;
 const TAG_LAMBDA: u8 = 5;
 
-
 impl<'ctx> CodeGen<'ctx> {
+   
    
     pub fn new(ctx: &'ctx Context, debug_mode: bool) -> Self {
         let module = ctx.create_module("tantalisp_main");
@@ -339,25 +339,27 @@ impl<'ctx> CodeGen<'ctx> {
         match expr {
             SExpr::Int(i) =>  self.box_int(self.ctx.i32_type().const_int(*i as u64, true)),
             SExpr::Bool(b) => self.box_bool(
-                if *b {
-                 self.ctx.bool_type().const_int(1, true)
-             } else { 
-                self.ctx.bool_type().const_zero()
-            }),
+                        if *b {
+                         self.ctx.bool_type().const_int(1, true)
+                     } else { 
+                        self.ctx.bool_type().const_zero()
+                    }),
             SExpr::String(str) => self.box_string(str),
             SExpr::Symbol(id) => self.emit_var_lookup(id),
             SExpr::DefExpr(id, val_expr) => self.emit_def(id, val_expr),
             SExpr::IfExpr(pred_expr, truthy_exprs, falsy_exprs) => {
-                self.emit_if(pred_expr, truthy_exprs, falsy_exprs)
-            },
+                        self.emit_if(pred_expr, truthy_exprs, falsy_exprs)
+                    },
             SExpr::LambdaExpr(params, body) => { 
-                let lambda_val = self.emit_lambda(params, body)?;
-                self.box_lambda(lambda_val)
-            },
+                        let lambda_val = self.emit_lambda(params, body)?;
+                        self.box_lambda(lambda_val)
+                    },
             SExpr::List(xs) if xs.is_empty() => self.box_nil(),
+            SExpr::List(sexprs) if CodeGen::is_builtin_proc(&sexprs) => self.emit_builtin_proc_call(&sexprs),
             SExpr::List(sexprs) => self.emit_call(&sexprs),
             SExpr::Vector(sexprs) => todo!(),
             SExpr::BuiltinFn(_, _) => todo!(),
+            SExpr::Quoted(sexpr) => todo!()
         }
     }
 
@@ -828,21 +830,7 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         let func = &items[0];
         let args = &items[1..];
 
-        if let SExpr::Symbol(op) = func {
-            match op.as_str() {
-                "+" => return self.emit_add(args),
-                "*" => return self.emit_mul(args),
-                "-" => return self.emit_sub(args),
-                "/" => return self.emit_div(args),
-                "=" => return self.emit_eq(args),
-                "!=" => return self.emit_ne(args),
-                "<" => return self.emit_lt(args),
-                ">" => return self.emit_gt(args),
-                "<=" => return self.emit_le(args),
-                ">=" => return self.emit_ge(args),
-                _ => {}
-            }
-        }
+  
 
         let func = self.emit_expr(func)?;
         let func_ptr = self.unbox_lambda(func)?;
@@ -866,8 +854,42 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
 
         Ok(res.into_pointer_value())
 
-        // bail!("FunctionCalls for lisp functions not implemented yet!")
+    }
 
+    fn is_builtin_proc(args:&[SExpr]) -> bool {
+        let func = &args.get(0);
+        if let Some(SExpr::Symbol(op)) = func {
+            match op.as_str() {
+                "+" |  "*" |  "/" | "=" |"!=" | "<" | ">" | "<=" | ">=" =>  true,
+                _ => false
+            }
+        } else {
+            false
+        }
+    }
+
+    fn emit_builtin_proc_call(&mut self, args:&[SExpr]) -> Result<PointerValue<'ctx>> {
+        let func = &args[0];
+        let args = &args[1..];
+        if let SExpr::Symbol(op) = func {
+            match op.as_str() {
+                "+" =>  self.emit_add(args),
+                "*" =>  self.emit_mul(args),
+                "-" =>  self.emit_sub(args),
+                "/" =>  self.emit_div(args),
+                "=" =>  self.emit_eq(args),
+                "!=" =>  self.emit_ne(args),
+                "<" =>  self.emit_lt(args),
+                ">" =>  self.emit_gt(args),
+                "<=" =>  self.emit_le(args),
+                ">=" =>  self.emit_ge(args),
+                _ => bail!("Unsupported builtin proc provided, unknown op: {}", op)
+            }
+        } else {
+            bail!("Invalid builtin proc call, expected Symbol as first element, got: {:?}", args)
+        }
+
+        
     }
 
     fn emit_lambda(&mut self, params: &[SExpr], body: &[SExpr]) -> Result<FunctionValue<'ctx>> {
@@ -1113,11 +1135,11 @@ impl<'ctx> CodeGen<'ctx> {
 
 
 #[cfg(test)]
-mod compiler_tests {
+mod codegen_tests {
     use super::*;
 
     // Set to true to enable LLVM IR debug output for all tests
-    const DEBUG_MODE: bool = true;
+    const DEBUG_MODE: bool = false;
 
     #[test]
     fn scalar_int_expr() {
@@ -1166,10 +1188,10 @@ mod compiler_tests {
 
     #[test]
     #[ignore]
-    fn scalar_conditional_expr() {
+    fn test_quoted_empty_list() {
         let ctx = Context::create();
         let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
-        let res = compiler.emit_expr(&SExpr::Bool(false));
+        let res = compiler.repl_compile(&[SExpr::Quoted(Box::new(SExpr::List(vec![])))]);
 
         assert!(res.is_ok());
          
