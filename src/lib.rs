@@ -7,6 +7,8 @@ use std::io::{self, BufRead, Write};
 
 use anyhow::{anyhow, Result};
 use inkwell::context::Context;
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use lexer::tokenize;
 use parser::parse;
 use evaluator::{eval, eval_with_env};
@@ -49,43 +51,43 @@ impl<'l> Tantalisp<'l> {
    pub fn repl(&mut self) -> Result<()> {
         let mode = if self.interpreted_mode { "interpreter" } else { "JIT compiler" };
         let debug = if self.debug_mode { "ON" } else { "OFF" };
-    
+
         println!("Tantalisp REPL");
         println!("Mode: {} | Debug: {}", mode, debug);
-        println!("Type expressions to evaluate. Press Ctrl+D (Unix) or Ctrl+Z (Windows) to exit.");
-        println!("Special commands: :quit or :q to exit");
+
+        // Load prelude (standard library)
+        self.load_prelude()?;
+
+        println!("Type expressions to evaluate.");
+        println!("Exit: Ctrl+C, Ctrl+D, or type :quit");
         println!();
-    
-        
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        let mut line = String::new();
-    
+
+        // Create rustyline editor with history support
+        let mut rl = DefaultEditor::new()?;
+
+        // Optionally load history from file
+        let history_file = ".tantalisp_history";
+        let _ = rl.load_history(history_file); // Ignore error if file doesn't exist
+
         loop {
-            print!("tantalisp> ");
-            io::stdout().flush()?;
-    
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    // EOF (Ctrl+D)
-                    println!("\nBye!");
-                    break;
-                }
-                Ok(_) => {
+            match rl.readline("tantalisp> ") {
+                Ok(line) => {
                     let input = line.trim();
-    
+
                     // Skip empty lines
                     if input.is_empty() {
                         continue;
                     }
-    
+
+                    // Add to history
+                    let _ = rl.add_history_entry(&line);
+
                     // Handle special REPL commands
                     if input == ":quit" || input == ":q" {
                         println!("Bye!");
                         break;
                     }
-    
+
                     // Evaluate the expression with persistent environment
                     match self.rep_with_env(input) {
                         Ok(_) => {},
@@ -93,13 +95,26 @@ impl<'l> Tantalisp<'l> {
                     }
                     println!(); // Blank line between evaluations
                 }
-                Err(e) => {
-                    eprintln!("Error reading input: {}", e);
+                Err(ReadlineError::Interrupted) => {
+                    // Ctrl+C - Exit gracefully
+                    println!("\nBye!");
+                    break;
+                }
+                Err(ReadlineError::Eof) => {
+                    // Ctrl+D
+                    println!("\nBye!");
+                    break;
+                }
+                Err(err) => {
+                    eprintln!("Error: {:?}", err);
                     break;
                 }
             }
         }
-    
+
+        // Save history to file
+        let _ = rl.save_history(history_file);
+
         Ok(())
     }
 
@@ -129,7 +144,7 @@ impl<'l> Tantalisp<'l> {
 
     // REPL-friendly version that takes a mutable environment
     pub fn rep_with_env(&mut self, input: &str) -> Result<()> {
-        
+
         let tokens = tokenize(input)?;
         let ast = parse(&tokens[..])?;
         if self.interpreted_mode {
@@ -144,6 +159,47 @@ impl<'l> Tantalisp<'l> {
             println!("{}", result);
         }
 
+        Ok(())
+    }
+
+    // Load standard library (prelude) on REPL startup
+    fn load_prelude(&mut self) -> Result<()> {
+        use std::fs;
+        use std::path::Path;
+
+        // Try to find prelude.tlsp in current directory or parent directory
+        let prelude_paths = ["prelude.tlsp", "../prelude.tlsp", "../../prelude.tlsp"];
+
+        for prelude_path in &prelude_paths {
+            if Path::new(prelude_path).exists() {
+                let prelude_source = fs::read_to_string(prelude_path)
+                    .map_err(|e| anyhow!("Failed to read prelude: {}", e))?;
+
+                // Parse and evaluate each expression in the prelude
+                let tokens = tokenize(&prelude_source)?;
+                let ast = parse(&tokens[..])?;
+
+                if self.interpreted_mode {
+                    let env = self.interpreter_env.as_mut()
+                        .ok_or(anyhow!("interpreter_mode: ON but missing interpreter_env!"))?;
+                    for expr in ast {
+                        let _ = eval_with_env(env, vec![expr])?;
+                    }
+                } else {
+                    let codegen = self.codegen.as_mut()
+                        .ok_or(anyhow!("compiled_mode but empty codegen"))?;
+                    for expr in ast {
+                        let _ = codegen.repl_compile(&[expr])?;
+                    }
+                }
+
+                println!("Loaded standard library from {}", prelude_path);
+                return Ok(());
+            }
+        }
+
+        // Prelude not found - continue without it
+        println!("Note: prelude.tlsp not found, starting without standard library");
         Ok(())
     }
 

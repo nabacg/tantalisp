@@ -350,7 +350,11 @@ impl<'ctx> CodeGen<'ctx> {
             SExpr::Vector(sexprs) => todo!(),
             SExpr::BuiltinFn(_, _) => todo!(),
             SExpr::Quoted(sexpr) => {
-                self.emit_list(slice::from_ref(sexpr.as_ref()))
+                // Special case: '() should emit nil, not a list containing nil
+                match sexpr.as_ref() {
+                    SExpr::List(xs) if xs.is_empty() => self.box_nil(),
+                    _ => self.emit_list(slice::from_ref(sexpr.as_ref()))
+                }
             },
         }
     }
@@ -424,11 +428,11 @@ fn emit_def(&mut self, id: &String, val_expr: &Box<SExpr>) -> std::result::Resul
 fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_exprs: &Vec<SExpr>) -> std::result::Result<PointerValue<'ctx>, anyhow::Error> {
         let current_function = self.current_function
             .ok_or(anyhow!("Cannot codegen IfExpr with out current_function!"))?;
-    
+
         //eval predicate to LispVal pointer
         let pred_value_ptr = self.emit_expr(&*pred_expr)?;
-        // unbox value of predicate to int
-        let pred_val_bool = self.unbox_bool(pred_value_ptr)?;
+        // convert to truthy/falsy for conditional branching
+        let pred_val_bool = self.to_truthy(pred_value_ptr)?;
               
     
         // create BBs for branches
@@ -600,9 +604,6 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
     }
 
     fn box_list(&mut self, exprs: &[PointerValue<'ctx>]) -> Result<PointerValue<'ctx>> {
-        let new_lisp_val_ptr = self.alloc_lisp_val()?;
-        // write LIST_TAG 
-        self.lisp_val_set_tag(new_lisp_val_ptr, TAG_LIST)?;
 
         let exprs_size = exprs.len();
         let last_element_index = exprs_size-1;
@@ -631,11 +632,8 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
             }
 
         }
-
-        let data_ptr = self.builder.build_struct_gep(self.lisp_val_type, new_lisp_val_ptr, 1, "data_ptr")?;
-        self.builder.build_store(data_ptr, list_head_ptr)?;
-
-        Ok(new_lisp_val_ptr)
+        let list_val = self.cons_into_lisp_val(list_head_ptr)?;
+        Ok(list_val)
     }
 
     fn box_lambda(&mut self, func: FunctionValue<'ctx>) -> Result<PointerValue<'ctx>> {
@@ -777,6 +775,47 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         Ok(value)
     }
 
+    /// Convert any LispVal to a boolean for use in conditionals
+    /// Falsy values: nil (tag 4) and :false (tag 1 with data=0)
+    /// Truthy values: everything else (ints, non-empty strings, lists, lambdas, :true)
+    fn to_truthy(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<IntValue<'ctx>> {
+        let tag = self.lisp_val_tag(lisp_val_ptr)?;
+
+        // Check if tag == TAG_NIL (4)
+        let is_nil = self.builder.build_int_compare(
+            IntPredicate::EQ,
+            tag,
+            self.ctx.i8_type().const_int(TAG_NIL as u64, false),
+            "is_nil"
+        )?;
+
+        // Check if tag == TAG_BOOL (1) AND data == 0
+        let is_bool = self.builder.build_int_compare(
+            IntPredicate::EQ,
+            tag,
+            self.ctx.i8_type().const_int(TAG_BOOL as u64, false),
+            "is_bool_tag"
+        )?;
+
+        let data = self.lisp_val_data(lisp_val_ptr)?;
+        let is_zero = self.builder.build_int_compare(
+            IntPredicate::EQ,
+            data,
+            self.ctx.i64_type().const_int(0, false),
+            "is_zero_data"
+        )?;
+
+        let is_false_bool = self.builder.build_and(is_bool, is_zero, "is_false_bool")?;
+
+        // Falsy if: is_nil OR is_false_bool
+        let is_falsy = self.builder.build_or(is_nil, is_false_bool, "is_falsy")?;
+
+        // Truthy is the opposite of falsy
+        let is_truthy = self.builder.build_not(is_falsy, "is_truthy")?;
+
+        Ok(is_truthy)
+    }
+
     /// --- Candidates for a separate type (struct) for LispValue related operations, but need access &mut self
 
     fn lisp_val_data(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<IntValue<'ctx>> {
@@ -895,7 +934,7 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         if let Some(SExpr::Symbol(op)) = func {
             match op.as_str() {
                 "+" | "-" | "*" | "/" | "=" | "!=" | "<" | ">" | "<=" | ">=" => true,
-                "list" | "cons" | "head" | "tail"  => true,
+                "list" | "cons" | "head" | "car" | "cdr" | "tail"  => true,
                 _ => false
             }
         } else {
@@ -1053,31 +1092,90 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
 
         let tail_ptr = self.builder
             .build_struct_gep(self.cons_cell_type, cons_cell_ptr, 1, "cons_cell_tail_ptr")?;
-        let tail_load = self.builder.build_load(ptr_type, 
+        let tail_load = self.builder.build_load(ptr_type,
             tail_ptr, "cons_cell_load_tail")?;
 
         let tail_cons_cell_ptr = tail_load.into_pointer_value();
-        // but because we need to return a LispVal, not ConsCell, we need to box 
-        let lisp_val = self.cons_into_lisp_val(tail_cons_cell_ptr)?;
 
-        Ok(lisp_val)
+        // Check if tail is null - if so, return nil instead of wrapping null in a list
+        let current_fn = self.current_function.ok_or(anyhow!("No current function for cdr"))?;
+        let is_null = self.builder.build_is_null(tail_cons_cell_ptr, "is_tail_null")?;
+
+        let nil_bb = self.ctx.append_basic_block(current_fn, "cdr_nil_case");
+        let list_bb = self.ctx.append_basic_block(current_fn, "cdr_list_case");
+        let merge_bb = self.ctx.append_basic_block(current_fn, "cdr_merge");
+
+        self.builder.build_conditional_branch(is_null, nil_bb, list_bb)?;
+
+        // Nil case: return boxed nil
+        self.builder.position_at_end(nil_bb);
+        let nil_result = self.box_nil()?;
+        self.builder.build_unconditional_branch(merge_bb)?;
+        let nil_bb_end = self.builder.get_insert_block().unwrap();
+
+        // List case: wrap cons cell in LispVal
+        self.builder.position_at_end(list_bb);
+        let list_result = self.cons_into_lisp_val(tail_cons_cell_ptr)?;
+        self.builder.build_unconditional_branch(merge_bb)?;
+        let list_bb_end = self.builder.get_insert_block().unwrap();
+
+        // Merge
+        self.builder.position_at_end(merge_bb);
+        let phi = self.builder.build_phi(self.ctx.ptr_type(AddressSpace::default()), "cdr_result_phi")?;
+        phi.add_incoming(&[(&nil_result, nil_bb_end), (&list_result, list_bb_end)]);
+
+        Ok(phi.as_basic_value().into_pointer_value())
     }
     
     fn emit_cons(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
         match args {
             [x, xs] => {
                 let new_elem_expr = self.emit_expr(x)?;
-                let list_expr =self.emit_expr(xs)?;
+                let list_expr = self.emit_expr(xs)?;
+
+                // Check if the second argument is nil or a list
+                let tag = self.lisp_val_tag(list_expr)?;
+                let is_nil = self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    tag,
+                    self.ctx.i8_type().const_int(TAG_NIL as u64, false),
+                    "is_nil_for_cons"
+                )?;
+
+                // Create basic blocks for nil and list cases
+                let current_fn = self.current_function.ok_or(anyhow!("No current function for cons"))?;
+                let nil_bb = self.ctx.append_basic_block(current_fn, "cons_nil_case");
+                let list_bb = self.ctx.append_basic_block(current_fn, "cons_list_case");
+                let merge_bb = self.ctx.append_basic_block(current_fn, "cons_merge");
+
+                self.builder.build_conditional_branch(is_nil, nil_bb, list_bb)?;
+
+                // Nil case: tail should be null pointer
+                self.builder.position_at_end(nil_bb);
+                let new_cons_nil = self.alloc_cons_cell()?;
+                self.cons_set_head(new_cons_nil, new_elem_expr)?;
+                let null_ptr = self.ctx.ptr_type(AddressSpace::default()).const_null();
+                self.cons_set_tail(new_cons_nil, null_ptr)?;
+                let result_nil = self.cons_into_lisp_val(new_cons_nil)?;
+                self.builder.build_unconditional_branch(merge_bb)?;
+                let nil_bb_end = self.builder.get_insert_block().unwrap();
+
+                // List case: tail should point to existing cons cell
+                self.builder.position_at_end(list_bb);
                 let cons_cell_ptr = self.unbox_list(list_expr)?;
+                let new_cons_list = self.alloc_cons_cell()?;
+                self.cons_set_head(new_cons_list, new_elem_expr)?;
+                self.cons_set_tail(new_cons_list, cons_cell_ptr)?;
+                let result_list = self.cons_into_lisp_val(new_cons_list)?;
+                self.builder.build_unconditional_branch(merge_bb)?;
+                let list_bb_end = self.builder.get_insert_block().unwrap();
 
-                let new_cons = self.alloc_cons_cell()?;
-                self.cons_set_head(new_cons, new_elem_expr)?;
-                self.cons_set_tail(new_cons, cons_cell_ptr)?;
+                // Merge
+                self.builder.position_at_end(merge_bb);
+                let phi = self.builder.build_phi(self.ctx.ptr_type(AddressSpace::default()), "cons_result_phi")?;
+                phi.add_incoming(&[(&result_nil, nil_bb_end), (&result_list, list_bb_end)]);
 
-
-                let new_lisp_val = self.cons_into_lisp_val(new_cons)?;
-                Ok(new_lisp_val)
-
+                Ok(phi.as_basic_value().into_pointer_value())
             },
             _ => bail!("cons expects 2 arguments!")
         }
@@ -1135,7 +1233,8 @@ fn lisp_val_to_string(lisp_val_ptr: *mut LispValLayout) -> Result<String> {
             }
 
             Ok(format!("({})", list_contents.join(" ")))
-        }
+        }, 
+        4 => Ok("nil".to_string()),
         5 => Ok("#<lambda>".to_string()), // Lambda
 
         _ => bail!("Returning other LispVal types not implemented yet, found: {}", lisp_val.tag)
@@ -1362,7 +1461,17 @@ mod codegen_tests {
             SExpr::Int(1),
             SExpr::Int(2)
         ]);
-        let expr = SExpr::List(vec![SExpr::Symbol("head".to_string()), list_expr]);
+        let expr = SExpr::List(vec![SExpr::Symbol("head".to_string()), list_expr.clone()]);
+
+
+        let result = compiler.repl_compile(&[expr]);
+        if let Err(e) = &result {
+            eprintln!("Error: {:?}", e);
+        }
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "1");
+
+        let expr = SExpr::List(vec![SExpr::Symbol("car".to_string()), list_expr]);
 
 
         let result = compiler.repl_compile(&[expr]);
@@ -1383,7 +1492,17 @@ mod codegen_tests {
             SExpr::Int(1),
             SExpr::Int(2)
         ]);
-        let expr = SExpr::List(vec![SExpr::Symbol("tail".to_string()), list_expr]);
+        let expr = SExpr::List(vec![SExpr::Symbol("tail".to_string()), list_expr.clone()]);
+
+
+        let result = compiler.repl_compile(&[expr]);
+        if let Err(e) = &result {
+            eprintln!("Error: {:?}", e);
+        }
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "(2)");
+
+        let expr = SExpr::List(vec![SExpr::Symbol("cdr".to_string()), list_expr]);
 
 
         let result = compiler.repl_compile(&[expr]);
@@ -1413,6 +1532,67 @@ mod codegen_tests {
         }
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "(47 1 2)");
+    }
+
+    #[test]
+    fn test_cons_onto_nil() {
+        // Test: (cons 1 '()) should return (1), not (1 nil)
+        let ctx = Context::create();
+        let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
+
+        // Test 1: (cons 1 '()) -> (1)
+        let nil_expr = SExpr::List(vec![]);
+        let expr = SExpr::List(vec![
+            SExpr::Symbol("cons".to_string()),
+            SExpr::Int(1),
+            nil_expr
+        ]);
+
+        let result = compiler.repl_compile(&[expr]);
+        if let Err(e) = &result {
+            eprintln!("Error: {:?}", e);
+        }
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "(1)", "(cons 1 '()) should produce (1), not (1 nil)");
+
+        // Test 2: (cons 1 (cons 2 '())) -> (1 2)
+        let nil_expr2 = SExpr::List(vec![]);
+        let inner_cons = SExpr::List(vec![
+            SExpr::Symbol("cons".to_string()),
+            SExpr::Int(2),
+            nil_expr2
+        ]);
+        let expr2 = SExpr::List(vec![
+            SExpr::Symbol("cons".to_string()),
+            SExpr::Int(1),
+            inner_cons
+        ]);
+
+        let result2 = compiler.repl_compile(&[expr2]);
+        assert!(result2.is_ok(), "Failed to evaluate (cons 1 (cons 2 '())): {:?}", result2.err());
+        assert_eq!(result2.unwrap(), "(1 2)", "(cons 1 (cons 2 '())) should produce (1 2)");
+
+        // Test 3: (cons 1 (list 2 3)) -> (1 2 3)
+        let list_expr = SExpr::List(vec![
+            SExpr::Symbol("list".to_string()),
+            SExpr::Int(2),
+            SExpr::Int(3)
+        ]);
+        let expr3 = SExpr::List(vec![
+            SExpr::Symbol("cons".to_string()),
+            SExpr::Int(1),
+            list_expr
+        ]);
+
+        let result3 = compiler.repl_compile(&[expr3]);
+        assert!(result3.is_ok(), "Failed to evaluate (cons 1 (list 2 3)): {:?}", result3.err());
+        assert_eq!(result3.unwrap(), "(1 2 3)", "(cons 1 (list 2 3)) should produce (1 2 3)");
+
+        // Test 4: '() -> nil
+        let quoted_nil = SExpr::Quoted(Box::new(SExpr::List(vec![])));
+        let result4 = compiler.repl_compile(&[quoted_nil]);
+        assert!(result4.is_ok(), "Failed to evaluate '(): {:?}", result4.err());
+        assert_eq!(result4.unwrap(), "nil", "'() should produce nil");
     }
 
     #[test]
@@ -1892,5 +2072,172 @@ mod codegen_tests {
         let result10 = codegen.repl_compile(&[call_fib_10]);
         assert!(result10.is_ok(), "Failed to evaluate fib(10): {:?}", result10.err());
         assert_eq!(result10.unwrap(), "89", "fib(10) should return 89");
+    }
+
+    #[test]
+    fn test_truthy_nil_is_falsy() {
+        // Test: (if '() 1 2) should return 2 (nil/empty list is falsy)
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
+
+        // Empty list represents nil
+        let expr = SExpr::IfExpr(
+            Box::new(SExpr::List(vec![])),
+            vec![SExpr::Int(1)],
+            vec![SExpr::Int(2)]
+        );
+
+        let result = codegen.repl_compile(&[expr]);
+        assert!(result.is_ok(), "Failed to evaluate (if '() 1 2): {:?}", result.err());
+        assert_eq!(result.unwrap(), "2", "(if '() 1 2) should return 2 because nil is falsy");
+    }
+
+    #[test]
+    fn test_truthy_false_is_falsy() {
+        // Test: (if :false 1 2) should return 2 (:false is falsy)
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
+
+        let expr = SExpr::IfExpr(
+            Box::new(SExpr::Bool(false)),
+            vec![SExpr::Int(1)],
+            vec![SExpr::Int(2)]
+        );
+
+        let result = codegen.repl_compile(&[expr]);
+        assert!(result.is_ok(), "Failed to evaluate (if :false 1 2): {:?}", result.err());
+        assert_eq!(result.unwrap(), "2", "(if :false 1 2) should return 2 because :false is falsy");
+    }
+
+    #[test]
+    fn test_truthy_true_is_truthy() {
+        // Test: (if :true 1 2) should return 1 (:true is truthy)
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
+
+        let expr = SExpr::IfExpr(
+            Box::new(SExpr::Bool(true)),
+            vec![SExpr::Int(1)],
+            vec![SExpr::Int(2)]
+        );
+
+        let result = codegen.repl_compile(&[expr]);
+        assert!(result.is_ok(), "Failed to evaluate (if :true 1 2): {:?}", result.err());
+        assert_eq!(result.unwrap(), "1", "(if :true 1 2) should return 1 because :true is truthy");
+    }
+
+    #[test]
+    fn test_truthy_integer_is_truthy() {
+        // Test: (if 0 1 2) should return 1 (even 0 is truthy!)
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
+
+        let expr = SExpr::IfExpr(
+            Box::new(SExpr::Int(0)),
+            vec![SExpr::Int(1)],
+            vec![SExpr::Int(2)]
+        );
+
+        let result = codegen.repl_compile(&[expr]);
+        assert!(result.is_ok(), "Failed to evaluate (if 0 1 2): {:?}", result.err());
+        assert_eq!(result.unwrap(), "1", "(if 0 1 2) should return 1 because integers are truthy");
+
+        // Test with non-zero integer
+        let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
+        let expr2 = SExpr::IfExpr(
+            Box::new(SExpr::Int(42)),
+            vec![SExpr::Int(1)],
+            vec![SExpr::Int(2)]
+        );
+
+        let result2 = codegen2.repl_compile(&[expr2]);
+        assert!(result2.is_ok(), "Failed to evaluate (if 42 1 2): {:?}", result2.err());
+        assert_eq!(result2.unwrap(), "1", "(if 42 1 2) should return 1 because integers are truthy");
+    }
+
+    #[test]
+    fn test_truthy_list_is_truthy() {
+        // Test: (if (list 1 2) 42 99) should return 42 (lists are truthy, even with elements)
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
+
+        let list_expr = SExpr::List(vec![
+            SExpr::Symbol("list".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(2)
+        ]);
+
+        let expr = SExpr::IfExpr(
+            Box::new(list_expr),
+            vec![SExpr::Int(42)],
+            vec![SExpr::Int(99)]
+        );
+
+        let result = codegen.repl_compile(&[expr]);
+        assert!(result.is_ok(), "Failed to evaluate (if (list 1 2) 42 99): {:?}", result.err());
+        assert_eq!(result.unwrap(), "42", "(if (list 1 2) 42 99) should return 42 because lists are truthy");
+    }
+
+    #[test]
+    fn test_truthy_lambda_is_truthy() {
+        // Test: (if (fn [x] x) 1 2) should return 1 (lambdas are truthy)
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
+
+        let lambda = SExpr::LambdaExpr(
+            vec![SExpr::Symbol("x".to_string())],
+            vec![SExpr::Symbol("x".to_string())]
+        );
+
+        let expr = SExpr::IfExpr(
+            Box::new(lambda),
+            vec![SExpr::Int(1)],
+            vec![SExpr::Int(2)]
+        );
+
+        let result = codegen.repl_compile(&[expr]);
+        assert!(result.is_ok(), "Failed to evaluate (if (fn [x] x) 1 2): {:?}", result.err());
+        assert_eq!(result.unwrap(), "1", "(if (fn [x] x) 1 2) should return 1 because lambdas are truthy");
+    }
+
+    #[test]
+    fn test_truthy_comparison_result() {
+        // Test: (if (= 1 1) 42 99) should return 42 (comparison returns :true which is truthy)
+        let context = Context::create();
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
+
+        let comparison = SExpr::List(vec![
+            SExpr::Symbol("=".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(1)
+        ]);
+
+        let expr = SExpr::IfExpr(
+            Box::new(comparison),
+            vec![SExpr::Int(42)],
+            vec![SExpr::Int(99)]
+        );
+
+        let result = codegen.repl_compile(&[expr]);
+        assert!(result.is_ok(), "Failed to evaluate (if (= 1 1) 42 99): {:?}", result.err());
+        assert_eq!(result.unwrap(), "42", "(if (= 1 1) 42 99) should return 42");
+
+        // Test with false comparison
+        let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
+        let comparison2 = SExpr::List(vec![
+            SExpr::Symbol("=".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(2)
+        ]);
+
+        let expr2 = SExpr::IfExpr(
+            Box::new(comparison2),
+            vec![SExpr::Int(42)],
+            vec![SExpr::Int(99)]
+        );
+
+        let result2 = codegen2.repl_compile(&[expr2]);
+        assert!(result2.is_ok(), "Failed to evaluate (if (= 1 2) 42 99): {:?}", result2.err());
+        assert_eq!(result2.unwrap(), "99", "(if (= 1 2) 42 99) should return 99");
     }
 }
