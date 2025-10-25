@@ -1116,11 +1116,13 @@ impl<'ctx> CodeGen<'ctx> {
 mod compiler_tests {
     use super::*;
 
+    // Set to true to enable LLVM IR debug output for all tests
+    const DEBUG_MODE: bool = true;
 
     #[test]
     fn scalar_int_expr() {
         let ctx = Context::create();
-        let mut compiler = CodeGen::new(&ctx, true);
+        let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
 
         let expr = SExpr::Int(42);
 
@@ -1132,7 +1134,7 @@ mod compiler_tests {
     #[test]
     fn scalar_bool_expr() {
         let ctx = Context::create();
-        let mut compiler = CodeGen::new(&ctx, true);
+        let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
 
         // Test false - in your runtime, bools might return as 0/1
         let expr = SExpr::Bool(false);
@@ -1141,7 +1143,7 @@ mod compiler_tests {
         assert_eq!(result.unwrap(), 0);
 
         // Test true
-        let mut compiler2 = CodeGen::new(&ctx, true);
+        let mut compiler2 = CodeGen::new(&ctx, DEBUG_MODE);
         let expr = SExpr::Bool(true);
         let result = compiler2.compile_and_run(&[expr]);
         assert!(result.is_ok());
@@ -1151,7 +1153,7 @@ mod compiler_tests {
     #[test]
     fn integer_math() {
         let ctx = Context::create();
-        let mut compiler = CodeGen::new(&ctx, true);
+        let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
 
         let expr = SExpr::List(
             vec![SExpr::Symbol("+".to_string()), SExpr::Int(41), SExpr::Int(1)]
@@ -1166,7 +1168,7 @@ mod compiler_tests {
     #[ignore]
     fn scalar_conditional_expr() {
         let ctx = Context::create();
-        let mut compiler = CodeGen::new(&ctx, true);
+        let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
         let res = compiler.emit_expr(&SExpr::Bool(false));
 
         assert!(res.is_ok());
@@ -1177,7 +1179,7 @@ mod compiler_tests {
     fn test_jit_integer_math() {
         // Create context
         let context = Context::create();
-        let mut codegen = CodeGen::new(&context, true);
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
         
         // Test 1: Simple arithmetic
         // (+ 40 2)
@@ -1209,7 +1211,7 @@ mod compiler_tests {
         ]);
         
         // Create fresh compiler for second test
-        let mut compiler2 = CodeGen::new(&context, true);
+        let mut compiler2 = CodeGen::new(&context, DEBUG_MODE);
         let result =  compiler2.compile_and_run(&[expr2]).unwrap();
         assert_eq!(42, result); 
     }
@@ -1218,7 +1220,7 @@ mod compiler_tests {
     fn test_repl_global_variables() {
         // Test that global variables persist across REPL evaluations
         let context = Context::create();
-        let mut codegen = CodeGen::new(&context, false);
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
 
         // First REPL line: (def x 42)
         let def_expr = SExpr::DefExpr(
@@ -1241,7 +1243,7 @@ mod compiler_tests {
     #[test]
     fn test_eq_operator() {
         let context = Context::create();
-        let mut codegen = CodeGen::new(&context, false);
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
 
         // Test: (= 1 1) should return true (1)
         let eq_expr = SExpr::List(vec![
@@ -1255,7 +1257,7 @@ mod compiler_tests {
         assert_eq!(result.unwrap(), 1, "(= 1 1) should return 1 (true)");
 
         // Test: (= 1 2) should return false (0)
-        let mut codegen2 = CodeGen::new(&context, false);
+        let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
         let ne_expr = SExpr::List(vec![
             SExpr::Symbol("=".to_string()),
             SExpr::Int(1),
@@ -1271,7 +1273,7 @@ mod compiler_tests {
     fn test_if_true_branch() {
         // Test: (if (= 1 1) 42 1) should return 42
         let context = Context::create();
-        let mut codegen = CodeGen::new(&context, false);
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
 
         let if_expr = SExpr::IfExpr(
             Box::new(SExpr::List(vec![
@@ -1292,7 +1294,7 @@ mod compiler_tests {
     fn test_if_false_branch() {
         // Test: (if (= 3 1) 1 42) should return 42
         let context = Context::create();
-        let mut codegen = CodeGen::new(&context, false);
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
 
         let if_expr = SExpr::IfExpr(
             Box::new(SExpr::List(vec![
@@ -1314,7 +1316,7 @@ mod compiler_tests {
         let context = Context::create();
 
         // Test: (!= 1 2) should return true (1)
-        let mut codegen1 = CodeGen::new(&context, false);
+        let mut codegen1 = CodeGen::new(&context, DEBUG_MODE);
         let expr1 = SExpr::List(vec![
             SExpr::Symbol("!=".to_string()),
             SExpr::Int(1),
@@ -1325,7 +1327,7 @@ mod compiler_tests {
         assert_eq!(result1.unwrap(), 1, "(!= 1 2) should return 1 (true)");
 
         // Test: (!= 1 1) should return false (0)
-        let mut codegen2 = CodeGen::new(&context, false);
+        let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
         let expr2 = SExpr::List(vec![
             SExpr::Symbol("!=".to_string()),
             SExpr::Int(1),
@@ -1341,7 +1343,7 @@ mod compiler_tests {
         let context = Context::create();
 
         // Test: (< 1 2) should return true (1)
-        let mut codegen1 = CodeGen::new(&context, false);
+        let mut codegen1 = CodeGen::new(&context, DEBUG_MODE);
         let expr1 = SExpr::List(vec![
             SExpr::Symbol("<".to_string()),
             SExpr::Int(1),
@@ -1352,7 +1354,7 @@ mod compiler_tests {
         assert_eq!(result1.unwrap(), 1, "(< 1 2) should return 1 (true)");
 
         // Test: (< 2 1) should return false (0)
-        let mut codegen2 = CodeGen::new(&context, false);
+        let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
         let expr2 = SExpr::List(vec![
             SExpr::Symbol("<".to_string()),
             SExpr::Int(2),
@@ -1368,7 +1370,7 @@ mod compiler_tests {
         let context = Context::create();
 
         // Test: (> 2 1) should return true (1)
-        let mut codegen1 = CodeGen::new(&context, false);
+        let mut codegen1 = CodeGen::new(&context, DEBUG_MODE);
         let expr1 = SExpr::List(vec![
             SExpr::Symbol(">".to_string()),
             SExpr::Int(2),
@@ -1379,7 +1381,7 @@ mod compiler_tests {
         assert_eq!(result1.unwrap(), 1, "(> 2 1) should return 1 (true)");
 
         // Test: (> 1 2) should return false (0)
-        let mut codegen2 = CodeGen::new(&context, false);
+        let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
         let expr2 = SExpr::List(vec![
             SExpr::Symbol(">".to_string()),
             SExpr::Int(1),
@@ -1395,7 +1397,7 @@ mod compiler_tests {
         let context = Context::create();
 
         // Test: (<= 1 2) should return true (1)
-        let mut codegen1 = CodeGen::new(&context, false);
+        let mut codegen1 = CodeGen::new(&context, DEBUG_MODE);
         let expr1 = SExpr::List(vec![
             SExpr::Symbol("<=".to_string()),
             SExpr::Int(1),
@@ -1406,7 +1408,7 @@ mod compiler_tests {
         assert_eq!(result1.unwrap(), 1, "(<= 1 2) should return 1 (true)");
 
         // Test: (<= 2 2) should return true (1)
-        let mut codegen2 = CodeGen::new(&context, false);
+        let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
         let expr2 = SExpr::List(vec![
             SExpr::Symbol("<=".to_string()),
             SExpr::Int(2),
@@ -1417,7 +1419,7 @@ mod compiler_tests {
         assert_eq!(result2.unwrap(), 1, "(<= 2 2) should return 1 (true)");
 
         // Test: (<= 2 1) should return false (0)
-        let mut codegen3 = CodeGen::new(&context, false);
+        let mut codegen3 = CodeGen::new(&context, DEBUG_MODE);
         let expr3 = SExpr::List(vec![
             SExpr::Symbol("<=".to_string()),
             SExpr::Int(2),
@@ -1433,7 +1435,7 @@ mod compiler_tests {
         let context = Context::create();
 
         // Test: (>= 2 1) should return true (1)
-        let mut codegen1 = CodeGen::new(&context, false);
+        let mut codegen1 = CodeGen::new(&context, DEBUG_MODE);
         let expr1 = SExpr::List(vec![
             SExpr::Symbol(">=".to_string()),
             SExpr::Int(2),
@@ -1444,7 +1446,7 @@ mod compiler_tests {
         assert_eq!(result1.unwrap(), 1, "(>= 2 1) should return 1 (true)");
 
         // Test: (>= 2 2) should return true (1)
-        let mut codegen2 = CodeGen::new(&context, false);
+        let mut codegen2 = CodeGen::new(&context, DEBUG_MODE);
         let expr2 = SExpr::List(vec![
             SExpr::Symbol(">=".to_string()),
             SExpr::Int(2),
@@ -1455,7 +1457,7 @@ mod compiler_tests {
         assert_eq!(result2.unwrap(), 1, "(>= 2 2) should return 1 (true)");
 
         // Test: (>= 1 2) should return false (0)
-        let mut codegen3 = CodeGen::new(&context, false);
+        let mut codegen3 = CodeGen::new(&context, DEBUG_MODE);
         let expr3 = SExpr::List(vec![
             SExpr::Symbol(">=".to_string()),
             SExpr::Int(1),
@@ -1471,7 +1473,7 @@ mod compiler_tests {
         // Test: (def x 40) (def f (fn [x] (* x 10))) (f (+ 2 x))
         // Expected: 420
         let context = Context::create();
-        let mut codegen = CodeGen::new(&context, false);
+        let mut codegen = CodeGen::new(&context, DEBUG_MODE);
 
         // Line 1: (def x 40)
         let def_x = SExpr::DefExpr(
