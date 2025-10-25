@@ -1,22 +1,9 @@
-use std::{collections::HashMap, fmt::Pointer, ops::Add, slice, sync::atomic};
+use std::{collections::HashMap, ffi::CStr, os::raw::c_char, slice, sync::atomic};
 
-use inkwell::{builder::Builder, context::Context, execution_engine::{ExecutionEngine, JitFunction}, module::Module, types::StructType, values::{FunctionValue, GlobalValue, IntValue, PointerValue}, AddressSpace, IntPredicate};
+use inkwell::{builder::Builder, context::Context, execution_engine::{ExecutionEngine, JitFunction}, module::Module, types::StructType, values::{FunctionValue, IntValue, PointerValue}, AddressSpace, IntPredicate};
 use anyhow::{anyhow, bail, Result};
 use crate::parser::SExpr;
 
-
-pub fn compile_and_run(exprs: &[SExpr], debug_mode: bool) -> Result<i32> {
-    let ctx = Context::create();
-    let mut codegen = CodeGen::new(&ctx, debug_mode);
-
-    codegen.compile_and_run(exprs)
-}
-
-pub fn repl_compile_and_run(ctx: &Context, exprs: &[SExpr], debug_mode: bool) -> Result<String> {
-    let mut codegen = CodeGen::new(ctx, debug_mode);
-
-    codegen.repl_compile(exprs)
-}
 
 //TODO - move to runtime.rs ?
 
@@ -113,6 +100,10 @@ impl<'ctx> CodeGen<'ctx> {
         let module = ctx.create_module("tantalisp_main");
         let builder = ctx.create_builder();
 
+        // Ptr type
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+
+
         // ┌─────────────────┐
         // │ LispVal         │
         // ├─────────────────┤
@@ -133,12 +124,9 @@ impl<'ctx> CodeGen<'ctx> {
 
         let cons_cell_type = ctx.opaque_struct_type("ConsCell");
         cons_cell_type.set_body(&[
-            ctx.i64_type().into(),
-            ctx.i64_type().into()
+            ptr_type.into(),
+            ptr_type.into()
         ], false);
-
-        // Ptr type
-        let ptr_type = ctx.ptr_type(AddressSpace::default());
 
         //Declare malloc: i64 -> i8*
         let malloc_fn_type = ptr_type.fn_type(&[ctx.i64_type().into()], false);
@@ -231,8 +219,51 @@ impl<'ctx> CodeGen<'ctx> {
 
         }
      
+    }
+
+    pub fn compile_and_run(&mut self, exprs: &[SExpr])  -> Result<String> {
+        let ptr_type = self.ctx.ptr_type(AddressSpace::default());
+        let main_fn_type = ptr_type.fn_type(&[], false);  // Returns ptr
+        let main_fn_name = "main";
+        let main_fn = self.module.add_function(main_fn_name, main_fn_type, None);
+        let entry_bb = self.ctx.append_basic_block(main_fn, "main_entry");
+        // set main function as current and entry_bb
+        self.builder.position_at_end(entry_bb);
+        self.current_function = Some(main_fn);
+
+        // compile main body
+
+        let compiled_body: Result<Vec<_>> = exprs.iter().map(|e| self.emit_expr(e)).collect();
+        let binding = compiled_body?;
+        let result_ptr = binding.last().ok_or(anyhow!("empty body after compilation"))?;
+
+        // return the pointer to LispVal
+        self.builder.build_return(Some(result_ptr))?;
+
+        if self.debug {
+            // print LLVM IR 
+            println!("-------- LLVM IR ---------");
+            self.module.print_to_stderr();
+            println!("--------------------------");
+        }
 
 
+        let engine = self.create_execution_engine()?;
+
+
+        
+        unsafe {
+            type MainFunc = unsafe extern "C" fn() -> *mut LispValLayout;
+            //get handle to the main function
+            let jit_function: JitFunction<MainFunc> = engine.get_function(main_fn_name)?;
+
+            //call it
+            let lisp_val_ptr = jit_function.call();
+            if lisp_val_ptr.is_null() {
+                bail!("JIT returned null pointer");
+            }
+            lisp_val_to_string(lisp_val_ptr)
+        }
     }
 
 
@@ -292,58 +323,6 @@ impl<'ctx> CodeGen<'ctx> {
         );  
 
         Ok(engine)
-    }
-
-    pub fn compile_and_run(&mut self, exprs: &[SExpr])  -> Result<i32> {
-        let ptr_type = self.ctx.ptr_type(AddressSpace::default());
-        let main_fn_type = ptr_type.fn_type(&[], false);  // Returns ptr
-        let main_fn_name = "main";
-        let main_fn = self.module.add_function(main_fn_name, main_fn_type, None);
-        let entry_bb = self.ctx.append_basic_block(main_fn, "main_entry");
-        // set main function as current and entry_bb
-        self.builder.position_at_end(entry_bb);
-        self.current_function = Some(main_fn);
-
-        // compile main body
-
-        let compiled_body: Result<Vec<_>> = exprs.iter().map(|e| self.emit_expr(e)).collect();
-        let binding = compiled_body?;
-        let result_ptr = binding.last().ok_or(anyhow!("empty body after compilation"))?;
-
-        // return the pointer to LispVal
-        self.builder.build_return(Some(result_ptr))?;
-
-        if self.debug {
-            // print LLVM IR 
-            println!("-------- LLVM IR ---------");
-            self.module.print_to_stderr();
-            println!("--------------------------");
-        }
-
-
-        let engine = self.create_execution_engine()?;
-
-        unsafe {
-            type MainFunc = unsafe extern "C" fn() -> *mut LispValLayout;
-            //get handle to the main function
-            let jit_function: JitFunction<MainFunc> = engine.get_function(main_fn_name)?;
-
-            //call it
-            let lisp_val_ptr = jit_function.call();
-            if lisp_val_ptr.is_null() {
-                bail!("JIT returned null pointer");
-            }
-            let lisp_val = &*lisp_val_ptr;
-            match lisp_val.tag {
-                0 => Ok(lisp_val.data as i32), // Int
-                1 => Ok(lisp_val.data as i32), // Bool
-                _ => bail!("Other LispVal types not implemented yet, found: {}", lisp_val.tag)
-            }
-
-
-        }
-
-
     }
 
     fn emit_expr(&mut self, expr: &SExpr) -> Result<PointerValue<'ctx>> {
@@ -490,9 +469,7 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
     
         phi_node.add_incoming(&[(truthy_result, truthy_bb_end), (falsy_result, falsy_bb_end)]);
     
-        // let cond_result = self.builder.build_return(Some(&phi_node.as_basic_value().into_pointer_value()))?;
         let cond_result = phi_node.as_basic_value().into_pointer_value();
-        // self.builder.build_return(Some(&phi_node.as_basic_value().into_pointer_value()))?;
     
         Ok(cond_result)
     }
@@ -525,24 +502,13 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
     fn box_int(&mut self, value: IntValue<'ctx>) -> Result<PointerValue<'ctx>> {
         // allocate new value on the heap
         let new_lisp_val_ptr = self.alloc_lisp_val()?;
-
-
-        // get element pointer (GEP) to the first field of the LispVal struct, i.e. the tag in tagged union
-        // build_struct_gep computes the address of the tag field.
-        let tag_ptr = self.builder.build_struct_gep(self.lisp_val_type, new_lisp_val_ptr, 0, "tag_ptr")?;
-        // create a IntValue with tag:TAG_INT
-        let tag = self.ctx.i8_type().const_int(TAG_INT as u64, false);
-        // write set tag to 0 on new_lisp_val
-        self.builder.build_store(tag_ptr, tag)?;
-
-        //same for actual int value
-        let data_ptr = self.builder.build_struct_gep(self.lisp_val_type, new_lisp_val_ptr, 1, "data_ptr")?;
+        // set BOOL tag
+        self.lisp_val_set_tag(new_lisp_val_ptr, TAG_INT)?;
 
         //but first need to extend i32 to i64, as that's the type of data field 
         // build_int_s_extend - Extends by copying the sign bit (the most significant bit) into all the new high-order bits. This is for signed integers.
         let i64_value = self.builder.build_int_s_extend(value, self.ctx.i64_type(), "extend")?;
-
-        self.builder.build_store(data_ptr, i64_value)?;
+        self.lisp_val_set_int_data(new_lisp_val_ptr, i64_value)?;
 
         Ok(new_lisp_val_ptr)
     }
@@ -550,24 +516,15 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
     fn box_bool(&mut self, value: IntValue<'ctx>) -> Result<PointerValue<'ctx>> {
         // allocate new value on the heap
         let new_lisp_val_ptr = self.alloc_lisp_val()?;
+        // set BOOL tag
+        self.lisp_val_set_tag(new_lisp_val_ptr, TAG_BOOL)?;
 
-
-        // get element pointer (GEP) to the first field of the LispVal struct, i.e. the tag in tagged union
-        // build_struct_gep computes the address of the tag field.
-        let tag_ptr = self.builder.build_struct_gep(self.lisp_val_type, new_lisp_val_ptr, 0, "tag_ptr")?;
-        // create a IntValue with tag:TAG_INT
-        let tag = self.ctx.i8_type().const_int(TAG_BOOL as u64, false);
-        // write set tag to 0 on new_lisp_val
-        self.builder.build_store(tag_ptr, tag)?;
-
-        //same for actual int value
-        let data_ptr = self.builder.build_struct_gep(self.lisp_val_type, new_lisp_val_ptr, 1, "data_ptr")?;
-
+        //same for box_int
         //but first need to extend i32 to i64, as that's the type of data field 
         // build_int_z_extend:        Extends by filling the new high-order bits with zeros. This is for unsigned integers.
         let i64_value = self.builder.build_int_z_extend(value, self.ctx.i64_type(), "extend")?;
+        self.lisp_val_set_int_data(new_lisp_val_ptr, i64_value)?;
 
-        self.builder.build_store(data_ptr, i64_value)?;
 
         Ok(new_lisp_val_ptr)
     }
@@ -576,9 +533,8 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         let new_lisp_val_ptr = self.alloc_lisp_val()?;
 
         // write STRING_TAG 
-        let tag_ptr = self.builder.build_struct_gep(self.lisp_val_type, new_lisp_val_ptr, 0, "tag_ptr")?;
-        let tag = self.ctx.i8_type().const_int(TAG_STRING as u64, false);
-        self.builder.build_store(tag_ptr, tag)?;
+        self.lisp_val_set_tag(new_lisp_val_ptr, TAG_STRING)?;
+
 
         //allocate space for the string itself (null-terminated )
         let str_len = value.len() + 1; //+1 for null
@@ -601,16 +557,7 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         
 
         // set actual data
-        let data_ptr = self.builder.build_struct_gep(
-            self.lisp_val_type,
-             new_lisp_val_ptr, 1   , "data_ptr")?;
-
-        // cast our str_ptr to i64 so it can be stored in second field
-        let ptr_as_int = self
-            .builder
-            .build_ptr_to_int(str_ptr, self.ctx.i64_type(), "ptr_to_int")?;
-        
-        self.builder.build_store(data_ptr, ptr_as_int)?;
+        self.lisp_val_set_ptr_data(new_lisp_val_ptr, str_ptr)?;
 
         Ok(new_lisp_val_ptr)
 
@@ -618,46 +565,72 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
 
     fn box_nil(&mut self) -> Result<PointerValue<'ctx>> {
         let new_lisp_val_ptr = self.alloc_lisp_val()?;
-
         // write NIL_TAG 
-        let tag_ptr = self.builder.build_struct_gep(self.lisp_val_type, 
-            new_lisp_val_ptr, 0, "tag_ptr")?;
-        let tag = self.ctx.i8_type().const_int(TAG_NIL as u64, false);
-        self.builder.build_store(tag_ptr, tag)?;
-
+        self.lisp_val_set_tag(new_lisp_val_ptr, TAG_NIL)?;
 
         Ok(new_lisp_val_ptr)
     }
 
+    fn cons_set_head(&mut self, cons_cell: PointerValue<'ctx>, value: PointerValue<'ctx> ) -> Result<()> {
+        let head_ptr = self.builder
+            .build_struct_gep(self.cons_cell_type, cons_cell, 0, "cons_head_ptr")?;
+        self.builder.build_store(head_ptr, value)?;
+
+        Ok(())
+    }
+
+    fn cons_set_tail(&mut self, cons_cell: PointerValue<'ctx>, value: PointerValue<'ctx>) -> Result<()> {
+        let head_ptr = self.builder
+        .build_struct_gep(self.cons_cell_type, cons_cell, 1, "cons_head_ptr")?;
+        self.builder.build_store(head_ptr, value)?;
+
+        Ok(())
+    }
+
+    fn cons_into_lisp_val(&mut self, value: PointerValue<'ctx>) -> Result<PointerValue<'ctx>> {
+        let lisp_val = self.alloc_lisp_val()?;
+        // write LIST_TAG 
+        self.lisp_val_set_tag(lisp_val, TAG_LIST)?;
+
+        let data_ptr = self.builder
+            .build_struct_gep(self.lisp_val_type, lisp_val, 1, "data_ptr")?;
+        self.builder.build_store(data_ptr, value)?;
+
+        Ok(lisp_val)
+    }
+
     fn box_list(&mut self, exprs: &[PointerValue<'ctx>]) -> Result<PointerValue<'ctx>> {
         let new_lisp_val_ptr = self.alloc_lisp_val()?;
-
         // write LIST_TAG 
-        let tag_ptr = self.builder.build_struct_gep(self.lisp_val_type, 
-            new_lisp_val_ptr, 0, "tag_ptr")?;
-        let tag = self.ctx.i8_type().const_int(TAG_LIST as u64, false);
-        self.builder.build_store(tag_ptr, tag)?;
+        self.lisp_val_set_tag(new_lisp_val_ptr, TAG_LIST)?;
 
-
-
+        let exprs_size = exprs.len();
+        let last_element_index = exprs_size-1;
         let mut current_head = self.alloc_cons_cell()?;
         let list_head_ptr = current_head.clone(); // keep the original head of the list in place for returning
-        for e in exprs {
-            let head_ptr = self.builder.build_struct_gep(self.cons_cell_type, current_head, 0, "cons_head_ptr")?;
-            self.builder.build_store(head_ptr, *e)?;
+        for (i, e) in exprs.iter().enumerate() {
 
-            let tail_ptr = self.builder.build_struct_gep(self.cons_cell_type, current_head, 1, "tail_ptr")?;
-            let next_elem = self.alloc_cons_cell()?;
-            self.builder.build_store(tail_ptr, next_elem)?;
+            self.cons_set_head(current_head, *e)?;
+            // let head_ptr = self.builder.build_struct_gep(self.cons_cell_type, current_head, 0, "cons_head_ptr")?;
+            // self.builder.build_store(head_ptr, *e)?;
 
-            current_head = next_elem;
+            // let tail_ptr = self.builder.build_struct_gep(self.cons_cell_type, current_head, 1, "tail_ptr")?;
+
+            if i == last_element_index {
+                let nil_terminator = self.ctx.ptr_type(AddressSpace::default()).const_null();
+                // self.builder.build_store(tail_ptr, nil_terminator)?;
+                self.cons_set_tail(current_head, nil_terminator)?;
+
+            } else {
+                let next_elem = self.alloc_cons_cell()?;
+                // self.builder.build_store(tail_ptr, next_elem)?;
+                self.cons_set_tail(current_head, next_elem)?;
+                 
+                current_head = next_elem;
+    
+            }
+
         }
-
-        let nil_terminator = self.ctx.ptr_type(AddressSpace::default()).const_null();
-
-        let tail_ptr = self.builder.build_struct_gep(self.cons_cell_type, current_head, 1, "tail_ptr")?;
-        self.builder.build_store(tail_ptr, nil_terminator)?;
-
 
         let data_ptr = self.builder.build_struct_gep(self.lisp_val_type, new_lisp_val_ptr, 1, "data_ptr")?;
         self.builder.build_store(data_ptr, list_head_ptr)?;
@@ -695,9 +668,6 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
   
         Ok(lisp_val_ptr)
     }
-
-
-
 
     // Box a string from a runtime i8* pointer and length
     fn box_string_from_ptr(
@@ -807,6 +777,8 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         Ok(value)
     }
 
+    /// --- Candidates for a separate type (struct) for LispValue related operations, but need access &mut self
+
     fn lisp_val_data(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<IntValue<'ctx>> {
         let int_ptr = self.builder.build_struct_gep(self.lisp_val_type, lisp_val_ptr, 1, "data_ptr")?;
         let data = self.builder.build_load(self.ctx.i64_type(), int_ptr, "load_string_ptr")?
@@ -828,6 +800,44 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         //TODO - branch and throw error, leaving for now
         Ok(())
     }
+
+    fn lisp_val_set_tag(&mut self, lisp_val_ptr: PointerValue<'ctx>, tag: u8) -> Result<()> {
+        // get element pointer (GEP) to the first field of the LispVal struct, i.e. the tag in tagged union
+        // build_struct_gep computes the address of the tag field.
+        let tag_ptr = self.builder.build_struct_gep(self.lisp_val_type, 
+            lisp_val_ptr, 0, "tag_ptr")?;
+        // tag value    
+        let tag = self.ctx.i8_type().const_int(tag as u64, false);
+        // write set tag to 0 on new_lisp_val
+        self.builder.build_store(tag_ptr, tag)?;
+        Ok(())
+    }
+
+    fn lisp_val_set_int_data(&mut self, lisp_val: PointerValue<'ctx>, int_val: IntValue<'ctx>) -> Result<()> {
+        //same for actual int value
+        let data_ptr = self.builder
+            .build_struct_gep(self.lisp_val_type, lisp_val, 1, "data_ptr")?;
+
+        self.builder.build_store(data_ptr, int_val)?;
+
+        Ok(())
+    }
+
+    fn lisp_val_set_ptr_data(&mut self, lisp_val: PointerValue<'ctx>, value_ptr: PointerValue<'ctx>) -> Result<()> {
+        let data_ptr = self.builder.build_struct_gep(
+            self.lisp_val_type,
+            lisp_val, 1   , "data_ptr")?;
+
+        // cast our value_ptr to i64 so it can be stored in second field
+        let ptr_as_int = self
+            .builder
+            .build_ptr_to_int(value_ptr, self.ctx.i64_type(), "ptr_to_int")?;
+        
+        self.builder.build_store(data_ptr, ptr_as_int)?;
+        Ok(())
+    }
+    /// ^^ Candidates for a separate type (struct) for LispValue related operations, but need access &mut self
+
 
     fn unbox_string(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<PointerValue<'ctx>> {
         self.lisp_val_check_tag(lisp_val_ptr, TAG_STRING)?;
@@ -855,8 +865,6 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
     fn emit_call(&mut self, items:&[SExpr]) -> Result<PointerValue<'ctx>> {
         let func = &items[0];
         let args = &items[1..];
-
-  
 
         let func = self.emit_expr(func)?;
         let func_ptr = self.unbox_lambda(func)?;
@@ -911,7 +919,9 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
                 "<=" =>  self.emit_le(args),
                 ">=" =>  self.emit_ge(args),
                 "list" => self.emit_list(args),
-                "head" => self.emit_head(args),
+                "head" | "car" => self.emit_car(args),
+                "tail" | "cdr" => self.emit_cdr(args),
+                "cons"  => self.emit_cons(args),
                 _ => bail!("Unsupported builtin proc provided, unknown op: {}", op)
             }
         } else {
@@ -1001,18 +1011,77 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         self.box_list(&elements)
     }
     
-    fn emit_head(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
-        todo!()
+    fn emit_car(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
 
-        // match args {
-        //     [lst] => {
-        //         let list_res = self.emit_expr(list)?;
-        //         let list_ptr = self.unbox_list(list_res)?;
-        //     },
-        //     _ => bail!("head expects single argument!")
-        // }
+        match args {
+            [lst] => {
+                let list_res = self.emit_expr(lst)?;
+                let cons_cell_ptr = self.unbox_list(list_res)?;
+                let head_ptr = self.emit_list_car(cons_cell_ptr)?;
+                Ok(head_ptr)
+
+            },
+            _ => bail!("head expects single argument!")
+        }
     }
 
+    fn emit_cdr(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
+
+        match args {
+            [lst] => {
+                let list_res = self.emit_expr(lst)?;
+                let cons_cell_ptr = self.unbox_list(list_res)?;
+                let tail_ptr = self.emit_list_cdr(cons_cell_ptr)?;
+                Ok(tail_ptr)
+
+            },
+            _ => bail!("tail expects single argument!")
+        }
+    }
+    
+    fn emit_list_car(&mut self, cons_cell_ptr: PointerValue<'ctx>) -> Result<PointerValue<'ctx>> {
+        let ptr_type = self.ctx.ptr_type(AddressSpace::default());
+        let head_ptr = self.builder.build_struct_gep(self.cons_cell_type, cons_cell_ptr, 0, "cons_cell_head_ptr")?;
+        let head_load = self.builder.build_load(ptr_type, 
+        head_ptr, "cons_cell_load_head")?;
+
+        Ok(head_load.into_pointer_value())
+    }
+
+    fn emit_list_cdr(&mut self, cons_cell_ptr: PointerValue<'ctx>) -> Result<PointerValue<'ctx>> {
+        let ptr_type = self.ctx.ptr_type(AddressSpace::default());
+
+        let tail_ptr = self.builder
+            .build_struct_gep(self.cons_cell_type, cons_cell_ptr, 1, "cons_cell_tail_ptr")?;
+        let tail_load = self.builder.build_load(ptr_type, 
+            tail_ptr, "cons_cell_load_tail")?;
+
+        let tail_cons_cell_ptr = tail_load.into_pointer_value();
+        // but because we need to return a LispVal, not ConsCell, we need to box 
+        let lisp_val = self.cons_into_lisp_val(tail_cons_cell_ptr)?;
+
+        Ok(lisp_val)
+    }
+    
+    fn emit_cons(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
+        match args {
+            [x, xs] => {
+                let new_elem_expr = self.emit_expr(x)?;
+                let list_expr =self.emit_expr(xs)?;
+                let cons_cell_ptr = self.unbox_list(list_expr)?;
+
+                let new_cons = self.alloc_cons_cell()?;
+                self.cons_set_head(new_cons, new_elem_expr)?;
+                self.cons_set_tail(new_cons, cons_cell_ptr)?;
+
+
+                let new_lisp_val = self.cons_into_lisp_val(new_cons)?;
+                Ok(new_lisp_val)
+
+            },
+            _ => bail!("cons expects 2 arguments!")
+        }
+    }
     
 
 
@@ -1022,6 +1091,18 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
 fn cons_cell_ptr_from_data_ptr(addr: i64) -> *const ConsCellLayout {
     let addr: usize  = addr as u64 as usize;
     addr as *const ConsCellLayout
+}
+
+fn list_val_data_to_str<'a>(addr: i64) -> Option<&'a str> {
+    let addr: usize = addr as u64 as usize;
+    let data_ptr = addr as *const c_char; 
+    if data_ptr.is_null() {
+        None
+    } else {
+        let str = unsafe { CStr::from_ptr(data_ptr).to_str().ok()? };
+        Some(str)
+    }
+
 }
 
 fn lisp_val_to_string(lisp_val_ptr: *mut LispValLayout) -> Result<String> {
@@ -1036,17 +1117,21 @@ fn lisp_val_to_string(lisp_val_ptr: *mut LispValLayout) -> Result<String> {
                 Ok(":false".to_string())
             }
         },
+        2 => {
+            let str_ptr = list_val_data_to_str(lisp_val.data).ok_or(anyhow!("Failed to read String out of lisp_val"))?;
+            Ok(str_ptr.to_string())
+        },
         3 => {
             // TODO write a Rust Iterator impl for this !!
             let cons_cell = cons_cell_ptr_from_data_ptr(lisp_val.data);
-            let mut cons_cell_ref = unsafe { &*cons_cell};
+            let mut cons_cell_maybe = unsafe { cons_cell.as_ref()};
             let mut list_contents = vec![];
-            while !cons_cell_ref.tail.is_null() {
+            while let Some(cons_cell_ref) = cons_cell_maybe {
         
                 let current_str = lisp_val_to_string(cons_cell_ref.head)?;
                 list_contents.push(current_str);
 
-                cons_cell_ref = unsafe { &*cons_cell_ref.tail};
+                cons_cell_maybe = unsafe { cons_cell_ref.tail.as_ref()};
             }
 
             Ok(format!("({})", list_contents.join(" ")))
@@ -1231,7 +1316,7 @@ mod codegen_tests {
     const DEBUG_MODE: bool = false;
 
     #[test]
-    fn list_fn() {
+    fn test_list_fn() {
         let ctx = Context::create();
         let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
 
@@ -1247,7 +1332,7 @@ mod codegen_tests {
     }
 
     #[test]
-    fn nested_list_fn() {
+    fn test_nested_list_fn() {
         let ctx = Context::create();
         let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
 
@@ -1266,8 +1351,72 @@ mod codegen_tests {
         assert_eq!(result.unwrap(), "(11 (1 2))");
     }
 
+
     #[test]
-    fn scalar_int_expr() {
+    fn test_list_head() {
+        let ctx = Context::create();
+        let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
+
+        let list_expr = SExpr::List(vec![
+            SExpr::Symbol("list".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(2)
+        ]);
+        let expr = SExpr::List(vec![SExpr::Symbol("head".to_string()), list_expr]);
+
+
+        let result = compiler.repl_compile(&[expr]);
+        if let Err(e) = &result {
+            eprintln!("Error: {:?}", e);
+        }
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "1");
+    }
+
+    #[test]
+    fn test_list_tail() {
+        let ctx = Context::create();
+        let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
+
+        let list_expr = SExpr::List(vec![
+            SExpr::Symbol("list".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(2)
+        ]);
+        let expr = SExpr::List(vec![SExpr::Symbol("tail".to_string()), list_expr]);
+
+
+        let result = compiler.repl_compile(&[expr]);
+        if let Err(e) = &result {
+            eprintln!("Error: {:?}", e);
+        }
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "(2)");
+    }
+
+    #[test]
+    fn test_list_cons() {
+        let ctx = Context::create();
+        let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
+
+        let list_expr = SExpr::List(vec![
+            SExpr::Symbol("list".to_string()),
+            SExpr::Int(1),
+            SExpr::Int(2)
+        ]);
+        let expr = SExpr::List(vec![SExpr::Symbol("cons".to_string()), SExpr::Int(47), list_expr]);
+
+
+        let result = compiler.repl_compile(&[expr]);
+        if let Err(e) = &result {
+            eprintln!("Error: {:?}", e);
+        }
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "(47 1 2)");
+    }
+
+    #[test]
+    fn test_scalar_int_expr() {
         let ctx = Context::create();
         let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
 
@@ -1275,7 +1424,7 @@ mod codegen_tests {
 
         let result = compiler.compile_and_run(&[expr]);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
+        assert_eq!(result.unwrap(), "42");
     }
 
     #[test]
@@ -1287,14 +1436,14 @@ mod codegen_tests {
         let expr = SExpr::Bool(false);
         let result = compiler.compile_and_run(&[expr]);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 0);
+        assert_eq!(result.unwrap(), ":false");
 
         // Test true
         let mut compiler2 = CodeGen::new(&ctx, DEBUG_MODE);
         let expr = SExpr::Bool(true);
         let result = compiler2.compile_and_run(&[expr]);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 1);
+        assert_eq!(result.unwrap(), ":true");
     }
 
     #[test]
@@ -1308,7 +1457,7 @@ mod codegen_tests {
 
         let result = compiler.compile_and_run(&[expr]);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
+        assert_eq!(result.unwrap(), "42");
     }
 
     #[test]
@@ -1337,7 +1486,7 @@ mod codegen_tests {
         ]);
         
         match codegen.compile_and_run(&[expr1]) {
-            Ok(result) => assert_eq!(42, result),  // Should print 42
+            Ok(result) => assert_eq!("42", result),  // Should print 42
             Err(e) => eprintln!("Error: {}", e),
         }
         
@@ -1360,7 +1509,7 @@ mod codegen_tests {
         // Create fresh compiler for second test
         let mut compiler2 = CodeGen::new(&context, DEBUG_MODE);
         let result =  compiler2.compile_and_run(&[expr2]).unwrap();
-        assert_eq!(42, result); 
+        assert_eq!("42", result); 
     }
 
     #[test]
