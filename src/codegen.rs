@@ -584,13 +584,6 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         let str_len = value.len() + 1; //+1 for null
         let str_size = self.ctx.i64_type().const_int(str_len as u64, false);
 
-        // let str_ptr = self.builder
-        //     .build_call(self.malloc_fn, &[str_size.into()], "malloc_str")?
-        //     .try_as_basic_value()
-        //     .left()
-        //     .ok_or(anyhow!("Failed to malloc for string value"))?
-        //     .into_pointer_value();
-
         let str_ptr = self.call_malloc(str_size)?;
 
         // Create a global constant for the source string, as it will come from literal values in source code (list "a" )
@@ -779,7 +772,7 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
 
     // UNBOXING from LispVal
 
-    fn get_tag(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<IntValue<'ctx>> {
+    fn lisp_val_tag(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<IntValue<'ctx>> {
         let tag_ptr = self.builder.build_struct_gep(
             self.lisp_val_type,
             lisp_val_ptr,
@@ -796,18 +789,8 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
     }
 
     fn unbox_int(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<IntValue<'ctx>>  {
-        let tag= self.get_tag(lisp_val_ptr)?;
-        let expected_tag = self.ctx.i8_type().const_int(TAG_INT as u64, false);
-        self.builder.build_int_compare(IntPredicate::EQ, tag, expected_tag, "is_int_tag")?;
-
-        //TODO - branch and throw error, leaving for now
-
-        // assuming it was a right LispVal
-        //load it using struct GEP
-        let int_ptr = self.builder.build_struct_gep(self.lisp_val_type, lisp_val_ptr, 1, "data_ptr")?;
-        let int_val = self.builder.build_load(self.ctx.i64_type(), int_ptr, "load_int_val")?
-        .into_int_value();
-
+        self.lisp_val_check_tag(lisp_val_ptr, TAG_INT)?;
+        let int_val = self.lisp_val_data(lisp_val_ptr)?;
         // we still need to truncate i64 to i32
         let value = self.builder.build_int_truncate(int_val, self.ctx.i32_type(), "trunc_i64_i32")?;
 
@@ -815,17 +798,8 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
     }
 
     fn unbox_bool(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<IntValue<'ctx>>  {
-        let tag= self.get_tag(lisp_val_ptr)?;
-        let expected_tag = self.ctx.i8_type().const_int(TAG_BOOL as u64, false);
-        self.builder.build_int_compare(IntPredicate::EQ, tag, expected_tag, "is_int_tag")?;
-
-        //TODO - branch and throw error, leaving for now
-
-        // assuming it was a right LispVal
-        //load it using struct GEP
-        let int_ptr = self.builder.build_struct_gep(self.lisp_val_type, lisp_val_ptr, 1, "data_ptr")?;
-        let int_val = self.builder.build_load(self.ctx.i64_type(), int_ptr, "load_int_val")?
-        .into_int_value();
+        self.lisp_val_check_tag(lisp_val_ptr, TAG_BOOL)?;
+        let int_val = self.lisp_val_data(lisp_val_ptr)?;
 
         // we still need to truncate i64 to i32
         let value = self.builder.build_int_truncate(int_val, self.ctx.bool_type(), "trunc_i64_i8")?;
@@ -833,57 +807,50 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         Ok(value)
     }
 
-    fn unbox_string(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<PointerValue<'ctx>> {
-        let tag= self.get_tag(lisp_val_ptr)?;
-        let expected_tag = self.ctx.i8_type().const_int(TAG_STRING as u64, false);
-        self.builder.build_int_compare(IntPredicate::EQ, tag, expected_tag, "is_int_tag")?;
-
-        //TODO - branch and throw error, leaving for now
+    fn lisp_val_data(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<IntValue<'ctx>> {
         let int_ptr = self.builder.build_struct_gep(self.lisp_val_type, lisp_val_ptr, 1, "data_ptr")?;
         let data = self.builder.build_load(self.ctx.i64_type(), int_ptr, "load_string_ptr")?
         .into_int_value();
-
-        // need to cast that int we loaded into data as string_ptr
-        let str_ptr = self.builder.build_int_to_ptr(data, self.ctx.ptr_type(AddressSpace::default()), "int_data_to_ptr")?;
-
-        Ok(str_ptr)
+        Ok(data)
     }
 
-    fn unbox_lambda(&mut self, lisp_value_ptr: PointerValue<'ctx>) -> Result<PointerValue<'ctx>> {
-        let tag= self.get_tag(lisp_value_ptr)?;
-        let expected_tag = self.ctx.i8_type().const_int(TAG_LAMBDA as u64, false);
-        self.builder.build_int_compare(IntPredicate::EQ, tag, expected_tag, "is_lambda_tag")?;
+    fn lisp_val_data_as_ptr(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<PointerValue<'ctx>> {
+        let data = self.lisp_val_data(lisp_val_ptr)?;
+        // need to cast that int to pointer for complex types (String, ConsCell etc)
+        let data_ptr = self.builder.build_int_to_ptr(data, self.ctx.ptr_type(AddressSpace::default()), "int_data_to_ptr")?;
+        Ok(data_ptr)
+    }
+
+    fn lisp_val_check_tag(&mut self, lisp_val_ptr: PointerValue<'ctx>, expected_tag: u8) -> Result<()> {
+        let tag = self.lisp_val_tag(lisp_val_ptr)?;
+        let expected_tag = self.ctx.i8_type().const_int(expected_tag as u64, false);
+        self.builder.build_int_compare(IntPredicate::EQ, tag, expected_tag, "is_correct_tag")?;
         //TODO - branch and throw error, leaving for now
+        Ok(())
+    }
 
-        let int_data_ptr = self.builder.build_struct_gep(self.lisp_val_type, lisp_value_ptr, 1 , "data_ptr")?;
-        let data = self.builder.build_load(self.ctx.i64_type(), int_data_ptr, "load_data_ptr")?.into_int_value();
+    fn unbox_string(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<PointerValue<'ctx>> {
+        self.lisp_val_check_tag(lisp_val_ptr, TAG_STRING)?;
 
-        let lambda_ptr = self.builder.build_int_to_ptr(data, self.ctx.ptr_type(AddressSpace::default()), "int_data_to_ptr")?;
+        let value_ptr = self.lisp_val_data_as_ptr(lisp_val_ptr)?;
 
-        Ok(lambda_ptr)
+        Ok(value_ptr)
+    }
 
+    fn unbox_list(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<PointerValue<'ctx>> {
+        self.lisp_val_check_tag(lisp_val_ptr, TAG_LIST)?;
+        let value_ptr = self.lisp_val_data_as_ptr(lisp_val_ptr)?;
+        Ok(value_ptr)
 
     }
 
-// Lisp Cons cell type
-// In C, this would be:
-// struct LispList {
-//     LispValue* head;
-//     LispList* tail;
-// }
+    fn unbox_lambda(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<PointerValue<'ctx>> {
+        self.lisp_val_check_tag(lisp_val_ptr, TAG_LAMBDA)?;
 
-    fn create_list_type(&self) -> StructType<'ctx> {
-        let list_type = self.ctx.opaque_struct_type("ListType");
-        let lisp_value_ptr = self.ctx.ptr_type(AddressSpace::default());
+        let value_ptr = self.lisp_val_data_as_ptr(lisp_val_ptr)?;
 
-        list_type.set_body(&[
-            lisp_value_ptr.into(), // head (car)
-            lisp_value_ptr.into()  // tail (cdr)
-        ], false);
-
-        list_type
+        Ok(value_ptr)
     }
-
 
     fn emit_call(&mut self, items:&[SExpr]) -> Result<PointerValue<'ctx>> {
         let func = &items[0];
@@ -944,6 +911,7 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
                 "<=" =>  self.emit_le(args),
                 ">=" =>  self.emit_ge(args),
                 "list" => self.emit_list(args),
+                "head" => self.emit_head(args),
                 _ => bail!("Unsupported builtin proc provided, unknown op: {}", op)
             }
         } else {
@@ -1032,6 +1000,18 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         let elements = elements?;
         self.box_list(&elements)
     }
+    
+    fn emit_head(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
+        todo!()
+
+        // match args {
+        //     [lst] => {
+        //         let list_res = self.emit_expr(list)?;
+        //         let list_ptr = self.unbox_list(list_res)?;
+        //     },
+        //     _ => bail!("head expects single argument!")
+        // }
+    }
 
     
 
@@ -1039,9 +1019,9 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
 }
 
 #[cfg(target_pointer_width = "64")]
-fn cons_cell_ptr_from_data_ptr(addr: i64) -> *mut ConsCellLayout {
+fn cons_cell_ptr_from_data_ptr(addr: i64) -> *const ConsCellLayout {
     let addr: usize  = addr as u64 as usize;
-    addr as *mut ConsCellLayout
+    addr as *const ConsCellLayout
 }
 
 fn lisp_val_to_string(lisp_val_ptr: *mut LispValLayout) -> Result<String> {
@@ -1264,6 +1244,26 @@ mod codegen_tests {
         let result = compiler.repl_compile(&[expr]);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "(1 2)");
+    }
+
+    #[test]
+    fn nested_list_fn() {
+        let ctx = Context::create();
+        let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
+
+        let expr = SExpr::List(vec![
+            SExpr::Symbol("list".to_string()),
+            SExpr::Int(11),
+            SExpr::List(vec![
+                SExpr::Symbol("list".to_string()),
+                SExpr::Int(1),
+                SExpr::Int(2)
+            ])
+        ]);
+
+        let result = compiler.repl_compile(&[expr]);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "(11 (1 2))");
     }
 
     #[test]
