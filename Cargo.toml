@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 atty = "0.2"
+inkwell = {version = "0.6.0", features = ["llvm18-1"] }
