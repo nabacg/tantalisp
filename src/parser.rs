@@ -19,120 +19,9 @@ pub enum SExpr {
     LambdaExpr(Vec<SExpr>, Vec<SExpr>),
     DefExpr(String, Box<SExpr>),
     List(Vec<SExpr>),
+    Quoted(Box<SExpr>),
     Vector(Vec<SExpr>),
     BuiltinFn(String, fn(&[SExpr]) -> anyhow::Result<SExpr>),
-}
-
-// Manual Debug implementation since function pointers don't auto-derive
-impl std::fmt::Debug for SExpr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SExpr::Int(n) => write!(f, "Int({})", n),
-            SExpr::Bool(b) => write!(f, "Bool({})", b),
-            SExpr::String(s) => write!(f, "String({:?})", s),
-            SExpr::Symbol(s) => write!(f, "Symbol({})", s),
-            SExpr::IfExpr(p, t, e) => write!(f, "IfExpr({:?}, {:?}, {:?})", p, t, e),
-            SExpr::LambdaExpr(p, b) => write!(f, "LambdaExpr({:?}, {:?})", p, b),
-            SExpr::DefExpr(n, v) => write!(f, "DefExpr({}, {:?})", n, v),
-            SExpr::List(l) => write!(f, "List({:?})", l),
-            SExpr::Vector(v) => write!(f, "Vector({:?})", v),
-            SExpr::BuiltinFn(name, _) => write!(f, "BuiltinFn({})", name),
-        }
-    }
-}
-
-// Manual PartialEq - compare builtins by name
-impl PartialEq for SExpr {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (SExpr::Int(a), SExpr::Int(b)) => a == b,
-            (SExpr::Bool(a), SExpr::Bool(b)) => a == b,
-            (SExpr::String(a), SExpr::String(b)) => a == b,
-            (SExpr::Symbol(a), SExpr::Symbol(b)) => a == b,
-            (SExpr::IfExpr(p1, t1, e1), SExpr::IfExpr(p2, t2, e2)) => {
-                p1 == p2 && t1 == t2 && e1 == e2
-            }
-            (SExpr::LambdaExpr(p1, b1), SExpr::LambdaExpr(p2, b2)) => p1 == p2 && b1 == b2,
-            (SExpr::DefExpr(n1, v1), SExpr::DefExpr(n2, v2)) => n1 == n2 && v1 == v2,
-            (SExpr::List(a), SExpr::List(b)) => a == b,
-            (SExpr::Vector(a), SExpr::Vector(b)) => a == b,
-            (SExpr::BuiltinFn(n1, _), SExpr::BuiltinFn(n2, _)) => n1 == n2,
-            _ => false,
-        }
-    }
-}
-
-// Display implementation for Lisp-style pretty printing
-impl std::fmt::Display for SExpr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SExpr::Int(n) => write!(f, "{}", n),
-            SExpr::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
-            SExpr::String(s) => write!(f, "\"{}\"", s),
-            SExpr::Symbol(s) => write!(f, "{}", s),
-            SExpr::List(exprs) => {
-                write!(f, "(")?;
-                for (i, expr) in exprs.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    write!(f, "{}", expr)?;
-                }
-                write!(f, ")")
-            }
-            SExpr::Vector(exprs) => {
-                write!(f, "[")?;
-                for (i, expr) in exprs.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    write!(f, "{}", expr)?;
-                }
-                write!(f, "]")
-            }
-            SExpr::IfExpr(pred, then_exprs, else_exprs) => {
-                write!(f, "(if {} ", pred)?;
-                if then_exprs.len() == 1 {
-                    write!(f, "{}", then_exprs[0])?;
-                } else {
-                    write!(f, "(do")?;
-                    for expr in then_exprs {
-                        write!(f, " {}", expr)?;
-                    }
-                    write!(f, ")")?;
-                }
-                write!(f, " ")?;
-                if else_exprs.len() == 1 {
-                    write!(f, "{}", else_exprs[0])?;
-                } else {
-                    write!(f, "(do")?;
-                    for expr in else_exprs {
-                        write!(f, " {}", expr)?;
-                    }
-                    write!(f, ")")?;
-                }
-                write!(f, ")")
-            }
-            SExpr::LambdaExpr(params, body) => {
-                write!(f, "(fn [")?;
-                for (i, param) in params.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    write!(f, "{}", param)?;
-                }
-                write!(f, "]")?;
-                for expr in body {
-                    write!(f, " {}", expr)?;
-                }
-                write!(f, ")")
-            }
-            SExpr::DefExpr(name, value) => {
-                write!(f, "(def {} {})", name, value)
-            }
-            SExpr::BuiltinFn(name, _) => write!(f, "#<builtin:{}>", name),
-        }
-    }
 }
 
 pub struct Parser<'a> {
@@ -154,6 +43,7 @@ impl<'a> Iterator for Parser<'a> {
             Token::LeftParen if self.is_if_expr() => self.consume_if(),
             Token::LeftParen if self.is_lambda_expr() => self.consume_lambda(),
             Token::LeftParen => self.consume_list(),
+            Token::Quote => self.consume_quote(),
             c => Err(anyhow::anyhow!("Invalid Token stream, found: {:?}", c))
         })
     }
@@ -315,15 +205,139 @@ impl<'a> Parser<'a> {
         }
     }
     
-    fn consume_symbol(&mut self) -> std::result::Result<SExpr, anyhow::Error> {
+    fn consume_symbol(&mut self) -> Result<SExpr> {
         if let Some(Token::Symbol(s)) =  self.consume() {
             Ok(SExpr::Symbol(s.clone()))
         } else {
             bail!("Failed to parse String, expected int.")
         }
     }
+    
+    fn consume_quote(&mut self) -> Result<SExpr> {
+        self.consume(); //consume ' 
+
+        self.next()
+            .ok_or(anyhow!("Invalid Quoted expression, no expr after \'"))
+            .flatten()
+            .map(|e| SExpr::Quoted(Box::new(e)))
+    }
 
 }
+
+
+
+impl std::fmt::Debug for SExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SExpr::Int(n) => write!(f, "Int({})", n),
+            SExpr::Bool(b) => write!(f, "Bool({})", b),
+            SExpr::String(s) => write!(f, "String({:?})", s),
+            SExpr::Symbol(s) => write!(f, "Symbol({})", s),
+            SExpr::IfExpr(p, t, e) => write!(f, "IfExpr({:?}, {:?}, {:?})", p, t, e),
+            SExpr::LambdaExpr(p, b) => write!(f, "LambdaExpr({:?}, {:?})", p, b),
+            SExpr::DefExpr(n, v) => write!(f, "DefExpr({}, {:?})", n, v),
+            SExpr::List(l) => write!(f, "List({:?})", l),
+            SExpr::Vector(v) => write!(f, "Vector({:?})", v),
+            SExpr::BuiltinFn(name, _) => write!(f, "BuiltinFn({})", name),
+            SExpr::Quoted(sexpr) => write!(f, "Quoted({:?})", *sexpr),
+        }
+    }
+}
+
+impl PartialEq for SExpr {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SExpr::Int(a), SExpr::Int(b)) => a == b,
+            (SExpr::Bool(a), SExpr::Bool(b)) => a == b,
+            (SExpr::String(a), SExpr::String(b)) => a == b,
+            (SExpr::Symbol(a), SExpr::Symbol(b)) => a == b,
+            (SExpr::IfExpr(p1, t1, e1), SExpr::IfExpr(p2, t2, e2)) => {
+                p1 == p2 && t1 == t2 && e1 == e2
+            }
+            (SExpr::LambdaExpr(p1, b1), SExpr::LambdaExpr(p2, b2)) => p1 == p2 && b1 == b2,
+            (SExpr::DefExpr(n1, v1), SExpr::DefExpr(n2, v2)) => n1 == n2 && v1 == v2,
+            (SExpr::List(a), SExpr::List(b)) => a == b,
+            (SExpr::Vector(a), SExpr::Vector(b)) => a == b,
+            (SExpr::BuiltinFn(n1, _), SExpr::BuiltinFn(n2, _)) => n1 == n2,
+            (SExpr::Quoted(xs), SExpr::Quoted(ys)) => *xs == *ys,
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for SExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SExpr::Int(n) => write!(f, "{}", n),
+            SExpr::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
+            SExpr::String(s) => write!(f, "\"{}\"", s),
+            SExpr::Symbol(s) => write!(f, "{}", s),
+            SExpr::List(exprs) => {
+                        write!(f, "(")?;
+                        for (i, expr) in exprs.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, " ")?;
+                            }
+                            write!(f, "{}", expr)?;
+                        }
+                        write!(f, ")")
+                    }
+            SExpr::Vector(exprs) => {
+                        write!(f, "[")?;
+                        for (i, expr) in exprs.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, " ")?;
+                            }
+                            write!(f, "{}", expr)?;
+                        }
+                        write!(f, "]")
+                    }
+            SExpr::IfExpr(pred, then_exprs, else_exprs) => {
+                        write!(f, "(if {} ", pred)?;
+                        if then_exprs.len() == 1 {
+                            write!(f, "{}", then_exprs[0])?;
+                        } else {
+                            write!(f, "(do")?;
+                            for expr in then_exprs {
+                                write!(f, " {}", expr)?;
+                            }
+                            write!(f, ")")?;
+                        }
+                        write!(f, " ")?;
+                        if else_exprs.len() == 1 {
+                            write!(f, "{}", else_exprs[0])?;
+                        } else {
+                            write!(f, "(do")?;
+                            for expr in else_exprs {
+                                write!(f, " {}", expr)?;
+                            }
+                            write!(f, ")")?;
+                        }
+                        write!(f, ")")
+                    }
+            SExpr::LambdaExpr(params, body) => {
+                        write!(f, "(fn [")?;
+                        for (i, param) in params.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, " ")?;
+                            }
+                            write!(f, "{}", param)?;
+                        }
+                        write!(f, "]")?;
+                        for expr in body {
+                            write!(f, " {}", expr)?;
+                        }
+                        write!(f, ")")
+                    }
+            SExpr::DefExpr(name, value) => {
+                        write!(f, "(def {} {})", name, value)
+                    }
+            SExpr::BuiltinFn(name, _) => write!(f, "#<builtin:{}>", name),
+                        SExpr::Quoted(sexpr) => write!(f, "{}", *sexpr),
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod parser_tests {
@@ -424,6 +438,22 @@ mod parser_tests {
                 ]),
                 SExpr::Int(4)
             ])
+        );
+    }
+
+    // ===== Quoted List ===== 
+    #[test]
+    fn parse_quoted_list_with_ints() {
+        assert_eq!(
+            parse_one(&[
+                Token::Quote,
+                Token::LeftParen,
+                Token::Int(1),
+                Token::Int(2),
+                Token::Int(3),
+                Token::RightParen
+            ]),
+            SExpr::Quoted(Box::new(SExpr::List(vec![SExpr::Int(1), SExpr::Int(2), SExpr::Int(3)])))
         );
     }
 

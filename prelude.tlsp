@@ -1,0 +1,70 @@
+(def map (fn [f lst]
+  (if lst
+    (cons (f (car lst)) (map f (cdr lst)))
+    '())))
+
+(def filter (fn [pred lst]
+  (if lst
+    (if (pred (car lst))
+      (cons (car lst) (filter pred (cdr lst)))
+      (filter pred (cdr lst)))
+    '())))
+
+(def reduce (fn [f acc lst]
+  (if lst
+    (reduce f (f acc (car lst)) (cdr lst))
+    acc)))
+
+(def length (fn [lst]
+  (if lst
+    (+ 1 (length (cdr lst)))
+    0)))
+
+(def sum (fn [lst]
+  (reduce + 0 lst)))
+
+(def reverse (fn [lst]
+  (if lst
+    (append (reverse (cdr lst)) (cons (car lst) '()))
+    '())))
+
+(def append (fn [xs ys]
+  (if xs
+    (cons (car xs) (append (cdr xs) ys))
+    ys)))
+
+(def take (fn [n lst]
+  (if (= n 0)
+    '()
+    (if lst
+      (cons (car lst) (take (- n 1) (cdr lst)))
+      '()))))
+
+(def drop (fn [n lst]
+  (if (= n 0)
+    lst
+    (if lst
+      (drop (- n 1) (cdr lst))
+      '()))))
+
+(def any (fn [pred lst]
+  (if lst
+    (if (pred (car lst))
+      :true
+      (any pred (cdr lst)))
+    :false)))
+
+(def all (fn [pred lst]
+  (if lst
+    (if (pred (car lst))
+      (all pred (cdr lst))
+      :false)
+    :true)))
+
+(def range-helper (fn [current end]
+  (if (>= current end)
+    '()
+    (cons current (range-helper (+ current 1) end)))))
+
+(def range (fn [n]
+  (range-helper 0 n)))

@@ -64,13 +64,18 @@ impl<'a> Tokenizer<'a> {
         }
     }
     
-    fn consume_bracket(&mut self) -> std::result::Result<Token, anyhow::Error> {
+    fn consume_bracket(&mut self) -> Result<Token> {
         match self.consume() {
             None => bail!("Expected '[' or ']' but found end of Stream" ),
             Some('[') => Ok(Token::LeftBracket),
             Some(']') => Ok(Token::RightBracket),
             Some(c) => bail!("Expected '[' or ']' but found: {}", c )
         }
+    }
+    
+    fn consume_quote(&mut self) -> Result<Token> {
+        self.consume();
+        Ok(Token::Quote)
     }
 }
 
@@ -82,7 +87,8 @@ pub enum Token {
     LeftParen,
     RightParen,
     LeftBracket,
-    RightBracket
+    RightBracket,
+    Quote
 }
 
 fn is_symbol_char(c: &char) -> bool {
@@ -104,6 +110,7 @@ impl<'a> Iterator for Tokenizer<'a> {
 
         Some(
         match self.peek()? {
+            '\'' => self.consume_quote(),
             '(' | ')' => self.consume_paren(),
             '[' | ']' => self.consume_bracket(),
             '"' => self.consume_string(),
@@ -150,6 +157,30 @@ mod lexer_tests {
                                                             Int(5), 
                                                             RightParen])
     }
+
+
+
+
+
+    #[test]
+    fn quoted_empty_list() {
+        assert_eq!(tokenize("'()").unwrap(), vec![Quote, 
+                                                            LeftParen,                         
+                                                            RightParen])
+    }
+
+    #[test]
+    fn quoted_list_of_ints() {
+        assert_eq!(tokenize("'(1 2 3 4 5)").unwrap(), vec![Quote, 
+                                                            LeftParen, 
+                                                            Int(1), 
+                                                            Int(2),
+                                                            Int(3),
+                                                            Int(4),
+                                                            Int(5), 
+                                                            RightParen])
+    }
+
 
 
     #[test]

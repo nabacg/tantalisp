@@ -1,0 +1,5 @@
+;; Test the prelude functions
+(sum (list 1 2 3 4 5))
+(length (list 1 2 3))
+(filter (fn [x] (> x 2)) (list 1 2 3 4))
+(map (fn [x] (* x 2)) (list 1 2 3))

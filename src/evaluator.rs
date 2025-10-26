@@ -192,72 +192,73 @@ fn eval_expr(env: &mut Environment, expr: SExpr) -> Result<SExpr> {
         SExpr::Bool(b) => Ok(SExpr::Bool(b)),
         SExpr::String(s) => Ok(SExpr::String(s)),
         SExpr::Symbol(sym) => env.get(&sym)
-                                            .map(|e| e.clone()),
-  
+                                                .map(|e| e.clone()),
         SExpr::Vector(sexprs) =>  { 
-          let vec_of_results: Result<Vec<SExpr>> =  sexprs.into_iter().map(|e| eval_expr(env, e)).collect();
-          Ok(SExpr::Vector(vec_of_results?))
+              let vec_of_results: Result<Vec<SExpr>> =  sexprs.into_iter().map(|e| eval_expr(env, e)).collect();
+              Ok(SExpr::Vector(vec_of_results?))
           
-        },
+            },
         SExpr::IfExpr(pred, truthy_exprs, falsy_exprs) => {
-            let pred_value = eval_expr(env, *pred)?;
-            if is_expr_true(pred_value) {
-                truthy_exprs.into_iter().map(|e| eval_expr(env, e)).last().ok_or(anyhow!("empty truthy exprs"))?
-            } else {
-                falsy_exprs.into_iter().map(|e| eval_expr(env, e)).last().ok_or(anyhow!("empty falsy exprs"))?
-            }
-        },
+                let pred_value = eval_expr(env, *pred)?;
+                if is_expr_true(pred_value) {
+                    truthy_exprs.into_iter().map(|e| eval_expr(env, e)).last().ok_or(anyhow!("empty truthy exprs"))?
+                } else {
+                    falsy_exprs.into_iter().map(|e| eval_expr(env, e)).last().ok_or(anyhow!("empty falsy exprs"))?
+                }
+            },
         SExpr::LambdaExpr(params, body) => Ok(SExpr::LambdaExpr(params, body)),
         SExpr::BuiltinFn(name, func) => Ok(SExpr::BuiltinFn(name, func)),
         SExpr::DefExpr(var_name, var_value) => {
-            let val = eval_expr(env, *var_value)?;
-            let res = val.clone();
-            env.define(var_name, val);
-            Ok(res)
-        },
+                let val = eval_expr(env, *var_value)?;
+                let res = val.clone();
+                env.define(var_name, val);
+                Ok(res)
+            },
+        SExpr::Quoted(sexpr) =>  Ok(*sexpr),
         SExpr::List(sexprs) => {
-            if sexprs.is_empty() {
-                bail!("Cannot evaluate empty list ()");
-            }
-
-            let fn_value = eval_expr(env, sexprs[0].clone())?;
-
-            // Evaluate arguments
-            let args: Result<Vec<SExpr>> = sexprs[1..]
-                .iter()
-                .map(|e| eval_expr(env, e.clone()))
-                .collect();
-            let args = args?;
-
-            match fn_value {
-                SExpr::BuiltinFn(_, func) => func(&args),
-                SExpr::LambdaExpr(params, body) => {
-                    if params.len() != args.len() {
-                        bail!(
-                            "Arity mismatch: expected {} args, got {}",
-                            params.len(),
-                            args.len()
-                        );
-                    }
-
-                    let mut new_env = Environment::with_parent(env);
-
-                    for (i, p) in params.iter().enumerate() {
-                        if let SExpr::Symbol(param_sym) = p {
-                            new_env.define(param_sym.to_string(), args[i].clone());
-                        } else {
-                            bail!("Function parameter must be a symbol, got: {:?}", p);
-                        }
-                    }
-
-                    body.iter()
-                        .map(|e| eval_expr(&mut new_env, e.clone()))
-                        .last()
-                        .ok_or(anyhow!("Empty function body"))?
+                if sexprs.is_empty() {
+                    bail!("Cannot evaluate empty list ()");
                 }
-                _ => bail!("Not a function: {:?}", fn_value),
-            }
-        },
+
+                let fn_value = eval_expr(env, sexprs[0].clone())?;
+
+                // Evaluate arguments
+                let args: Result<Vec<SExpr>> = sexprs[1..]
+                    .iter()
+                    .map(|e| eval_expr(env, e.clone()))
+                    .collect();
+                let args = args?;
+
+                match fn_value {
+                    SExpr::BuiltinFn(_, func) => func(&args),
+                    SExpr::LambdaExpr(params, body) => {
+                        if params.len() != args.len() {
+                            bail!(
+                                "Arity mismatch: expected {} args, got {}",
+                                params.len(),
+                                args.len()
+                            );
+                        }
+
+                        let mut new_env = Environment::with_parent(env);
+
+                        for (i, p) in params.iter().enumerate() {
+                            if let SExpr::Symbol(param_sym) = p {
+                                new_env.define(param_sym.to_string(), args[i].clone());
+                            } else {
+                                bail!("Function parameter must be a symbol, got: {:?}", p);
+                            }
+                        }
+
+                        body.iter()
+                            .map(|e| eval_expr(&mut new_env, e.clone()))
+                            .last()
+                            .ok_or(anyhow!("Empty function body"))?
+                    }
+                    _ => bail!("Not a function: {:?}", fn_value),
+                }
+            },
+
     }
 }
 
@@ -363,6 +364,11 @@ mod evaluator_tests {
     // Helper to get Display string
     fn eval_display(input: &str) -> String {
         eval_str(input).unwrap().to_string()
+    }
+
+    #[test]
+    fn eval_quoted_exprs() {
+        assert_eq!(eval_display("'(+ 1 2 3)"), "(+ 1 2 3)");
     }
 
     // ===== Arithmetic Tests =====

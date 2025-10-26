@@ -6,4 +6,13 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 atty = "0.2"
+clap = { version = "4.5.50", features = ["derive"] }
 inkwell = {version = "0.6.0", features = ["llvm18-1"] }
+rustyline = "14.0"
+
+[profile.dev]
+opt-level = 0
+debug = 2
+debug-assertions = true
+overflow-checks = true
+lto = "off"
