@@ -3,7 +3,6 @@ mod parser;
 mod evaluator;
 mod codegen;
 
-use std::io::{self, BufRead, Write};
 
 use anyhow::{anyhow, Result};
 use inkwell::context::Context;
@@ -16,6 +15,9 @@ use codegen::CodeGen;
 
 // Re-export Environment for REPL
 pub use evaluator::Environment;
+
+// Re-export GC debug functions
+pub use codegen::{set_gc_debug_mode, start_gc_monitor};
 
 pub struct Tantalisp<'l> {
     debug_mode: bool,
@@ -56,7 +58,7 @@ impl<'l> Tantalisp<'l> {
         println!("Mode: {} | Debug: {}", mode, debug);
 
         // Load prelude (standard library)
-        //self.load_prelude()?;
+        self.load_prelude()?;
 
         println!("Type expressions to evaluate.");
         println!("Exit: Ctrl+C, Ctrl+D, or type :quit");
@@ -119,6 +121,9 @@ impl<'l> Tantalisp<'l> {
     }
 
     pub fn rep(&mut self, input: &str) -> Result<()> {
+        // Load prelude first (if not already loaded)
+        self.load_prelude()?;
+
         let tokens = tokenize(input)?;
         if self.debug_mode {
             println!("Tokens:\n{}", tokens.iter().map(|t| format!("{:?}", t)).collect::<Vec<_>>().join("\n"));

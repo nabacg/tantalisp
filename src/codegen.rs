@@ -6,7 +6,8 @@ use anyhow::{anyhow, bail, Result};
 use runtime::ConsCellLayout;
 use crate::parser::SExpr;
 mod runtime;
-use runtime::{alloc_cons_cell, alloc_lisp_val, alloc_string, lisp_val_decref, lisp_val_incref, runtime_get_var, runtime_set_var, LispValLayout, TAG_BOOL, TAG_INT, TAG_LAMBDA, TAG_LIST, TAG_NIL, TAG_STRING};
+pub use runtime::garbage_collector::{set_gc_debug_mode, start_gc_monitor};
+use runtime::{alloc_cons_cell, alloc_lisp_val, alloc_string, lisp_val_decref, lisp_val_incref, lisp_val_print_refcount, runtime_get_var, runtime_set_var, LispValLayout, TAG_BOOL, TAG_INT, TAG_LAMBDA, TAG_LIST, TAG_NIL, TAG_STRING};
 
 
 pub struct CodeGen<'ctx> {
@@ -29,6 +30,7 @@ pub struct CodeGen<'ctx> {
     alloc_string_fn: FunctionValue<'ctx>,
     incref_fn: FunctionValue<'ctx>,
     decref_fn: FunctionValue<'ctx>,
+    print_refcount_fn: FunctionValue<'ctx>,
 
     memcpy_fn: FunctionValue<'ctx>,
 
@@ -95,6 +97,9 @@ impl<'ctx> CodeGen<'ctx> {
         let decref_type = ctx.void_type().fn_type(&[ptr_type.into()], false);
         let decref_fn = module.add_function("lisp_val_decref", decref_type, None);
 
+        let print_refcount_type = ctx.void_type().fn_type(&[ptr_type.into()], false);
+        let print_refcount_fn = module.add_function("lisp_val_print_refcount", print_refcount_type, None);
+
 
         let mut c =Self {
             ctx,
@@ -108,6 +113,7 @@ impl<'ctx> CodeGen<'ctx> {
             alloc_string_fn,
             incref_fn,
             decref_fn,
+            print_refcount_fn,
             memcpy_fn: memcpy,
             local_env: HashMap::new(),
             current_function: None,
@@ -254,6 +260,11 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    fn emit_print_refcount(&mut self, val: PointerValue<'ctx>) -> Result<()> {
+        self.builder.build_call(self.print_refcount_fn, &[val.into()], "print_refcount_call")?;
+        Ok(())
+    }
+
 
 
     fn create_execution_engine(&mut self) -> Result<ExecutionEngine<'ctx>> {
@@ -314,6 +325,11 @@ impl<'ctx> CodeGen<'ctx> {
         engine.add_global_mapping(
             &self.alloc_string_fn,
             alloc_string as usize
+        );
+
+        engine.add_global_mapping(
+            &self.print_refcount_fn,
+            lisp_val_print_refcount as usize
         );
 
         Ok(engine)
@@ -420,6 +436,7 @@ fn emit_def(&mut self, id: &String, val_expr: &Box<SExpr>) -> std::result::Resul
                 name_global.as_pointer_value().into(),
                 val_ptr.into()
             ], "set_var_vall")?;
+        self.emit_incref(val_ptr)?;
         Ok(val_ptr)
     }
 
@@ -432,7 +449,9 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         // convert to truthy/falsy for conditional branching
         let pred_val_bool = self.to_truthy(pred_value_ptr)?;
               
-    
+        //no longer need pred_value_ptr
+        self.emit_decref(pred_value_ptr)?;
+
         // create BBs for branches
         let truthy_block = self.ctx.append_basic_block(current_function, "truthy_branch");
         let falsy_block = self.ctx.append_basic_block(current_function, "falsy_branch");
@@ -612,36 +631,22 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
     }
 
     fn box_list(&mut self, exprs: &[PointerValue<'ctx>]) -> Result<PointerValue<'ctx>> {
+        // Build list from right to left so tails can be LispVals
+        // (1 2 3) = cons(1, cons(2, cons(3, nil)))
 
-        let exprs_size = exprs.len();
-        let last_element_index = exprs_size-1;
-        let mut current_head = self.alloc_cons_cell()?;
-        let list_head_ptr = current_head.clone(); // keep the original head of the list in place for returning
-        for (i, e) in exprs.iter().enumerate() {
+        let mut tail = self.box_nil()?;  // Start with nil LispVal
 
-            self.cons_set_head(current_head, *e)?;
-            // let head_ptr = self.builder.build_struct_gep(self.cons_cell_type, current_head, 0, "cons_head_ptr")?;
-            // self.builder.build_store(head_ptr, *e)?;
+        // Iterate backwards through elements
+        for e in exprs.iter().rev() {
+            let cons_cell = self.alloc_cons_cell()?;
+            self.cons_set_head(cons_cell, *e)?;
+            self.cons_set_tail(cons_cell, tail)?;  // tail is a LispVal
 
-            // let tail_ptr = self.builder.build_struct_gep(self.cons_cell_type, current_head, 1, "tail_ptr")?;
-
-            if i == last_element_index {
-                let nil_terminator = self.ctx.ptr_type(AddressSpace::default()).const_null();
-                // self.builder.build_store(tail_ptr, nil_terminator)?;
-                self.cons_set_tail(current_head, nil_terminator)?;
-
-            } else {
-                let next_elem = self.alloc_cons_cell()?;
-                // self.builder.build_store(tail_ptr, next_elem)?;
-                self.cons_set_tail(current_head, next_elem)?;
-                 
-                current_head = next_elem;
-    
-            }
-
+            // Wrap this cons cell in a LispVal for the next iteration
+            tail = self.cons_into_lisp_val(cons_cell)?;
         }
-        let list_val = self.cons_into_lisp_val(list_head_ptr)?;
-        Ok(list_val)
+
+        Ok(tail)  // The final tail is the complete list
     }
 
     fn box_lambda(&mut self, func: FunctionValue<'ctx>) -> Result<PointerValue<'ctx>> {
@@ -917,9 +922,9 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         let func_ptr = self.unbox_lambda(func)?;
         let ptr_type = self.ctx.ptr_type(AddressSpace::default());
 
-        let args: Vec<_> = args.iter().map(|a| self.emit_expr(a)).collect::<Result<Vec<_>>>()?;
+        let arg_exprs: Vec<_> = args.iter().map(|a| self.emit_expr(a)).collect::<Result<Vec<_>>>()?;
 
-        let args: Vec<_> = args.iter().map(|a| (*a).into()).collect();   
+        let args: Vec<_> = arg_exprs.iter().map(|a| (*a).into()).collect();   
         let param_types:Vec<_> = args
             .iter()
             .map(|_| ptr_type.into())
@@ -931,7 +936,16 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
             .build_indirect_call(fn_type, func_ptr, &args, "lambda_call")
             .map_err(|e| anyhow!("error making indirect_call: {}", e))?;
 
-        let res = call_res.try_as_basic_value().left().ok_or(anyhow!("error converting indirect_call CallSite to PointerValue"))?;
+        let res = call_res
+            .try_as_basic_value()
+            .left()
+            .ok_or(anyhow!("error converting indirect_call CallSite to PointerValue"))?;
+
+        //can decref on args and lambda
+        self.emit_decref(func)?;
+        for arg in arg_exprs.into_iter() {
+            self.emit_decref(arg)?;
+        }
 
         Ok(res.into_pointer_value())
 
@@ -1035,12 +1049,11 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
 
 
         self.builder.build_return(Some(result))?;
-
-
         // restore previous environment and function
         self.local_env = current_env;
         self.current_function = current_fn;
         self.builder.position_at_end(current_block);
+
 
         if new_lambda.verify(true) {
             Ok(new_lambda)
@@ -1065,6 +1078,8 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
                 let list_res = self.emit_expr(lst)?;
                 let cons_cell_ptr = self.unbox_list(list_res)?;
                 let head_ptr = self.emit_list_car(cons_cell_ptr)?;
+                self.emit_incref(head_ptr)?;  // incref head since we're returning it
+                self.emit_decref(list_res)?;   // decref input list
                 Ok(head_ptr)
 
             },
@@ -1079,6 +1094,10 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
                 let list_res = self.emit_expr(lst)?;
                 let cons_cell_ptr = self.unbox_list(list_res)?;
                 let tail_ptr = self.emit_list_cdr(cons_cell_ptr)?;
+                // Tail is already a LispVal, incref it since we're returning it
+                self.emit_incref(tail_ptr)?;
+                // Decref input list - this is now safe! The tail has its own refcount.
+                self.emit_decref(list_res)?;
                 Ok(tail_ptr)
 
             },
@@ -1098,92 +1117,32 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
     fn emit_list_cdr(&mut self, cons_cell_ptr: PointerValue<'ctx>) -> Result<PointerValue<'ctx>> {
         let ptr_type = self.ctx.ptr_type(AddressSpace::default());
 
+        // Tail is now a LispVal (either another list or nil), just load and return it!
         let tail_ptr = self.builder
             .build_struct_gep(self.cons_cell_type, cons_cell_ptr, 1, "cons_cell_tail_ptr")?;
-        let tail_load = self.builder.build_load(ptr_type,
+        let tail_lisp_val = self.builder.build_load(ptr_type,
             tail_ptr, "cons_cell_load_tail")?;
 
-        let tail_cons_cell_ptr = tail_load.into_pointer_value();
-
-        // Check if tail is null - if so, return nil instead of wrapping null in a list
-        let current_fn = self.current_function.ok_or(anyhow!("No current function for cdr"))?;
-        let is_null = self.builder.build_is_null(tail_cons_cell_ptr, "is_tail_null")?;
-
-        let nil_bb = self.ctx.append_basic_block(current_fn, "cdr_nil_case");
-        let list_bb = self.ctx.append_basic_block(current_fn, "cdr_list_case");
-        let merge_bb = self.ctx.append_basic_block(current_fn, "cdr_merge");
-
-        self.builder.build_conditional_branch(is_null, nil_bb, list_bb)?;
-
-        // Nil case: return boxed nil
-        self.builder.position_at_end(nil_bb);
-        let nil_result = self.box_nil()?;
-        self.builder.build_unconditional_branch(merge_bb)?;
-        let nil_bb_end = self.builder.get_insert_block().unwrap();
-
-        // List case: wrap cons cell in LispVal
-        self.builder.position_at_end(list_bb);
-        let list_result = self.cons_into_lisp_val(tail_cons_cell_ptr)?;
-        self.builder.build_unconditional_branch(merge_bb)?;
-        let list_bb_end = self.builder.get_insert_block().unwrap();
-
-        // Merge
-        self.builder.position_at_end(merge_bb);
-        let phi = self.builder.build_phi(self.ctx.ptr_type(AddressSpace::default()), "cdr_result_phi")?;
-        phi.add_incoming(&[(&nil_result, nil_bb_end), (&list_result, list_bb_end)]);
-
-        Ok(phi.as_basic_value().into_pointer_value())
+        Ok(tail_lisp_val.into_pointer_value())
     }
     
     fn emit_cons(&mut self, args: &[SExpr]) -> Result<PointerValue<'ctx>> {
         match args {
             [x, xs] => {
                 let new_elem_expr = self.emit_expr(x)?;
-                let list_expr = self.emit_expr(xs)?;
+                let tail_expr = self.emit_expr(xs)?;
 
-                // Check if the second argument is nil or a list
-                let tag = self.lisp_val_tag(list_expr)?;
-                let is_nil = self.builder.build_int_compare(
-                    IntPredicate::EQ,
-                    tag,
-                    self.ctx.i8_type().const_int(TAG_NIL as u64, false),
-                    "is_nil_for_cons"
-                )?;
+                // Since tail is now a LispVal, we can just use tail_expr directly (nil or list)
+                let new_cons = self.alloc_cons_cell()?;
+                self.cons_set_head(new_cons, new_elem_expr)?;
+                self.cons_set_tail(new_cons, tail_expr)?;  // tail_expr is a LispVal (nil or list)
 
-                // Create basic blocks for nil and list cases
-                let current_fn = self.current_function.ok_or(anyhow!("No current function for cons"))?;
-                let nil_bb = self.ctx.append_basic_block(current_fn, "cons_nil_case");
-                let list_bb = self.ctx.append_basic_block(current_fn, "cons_list_case");
-                let merge_bb = self.ctx.append_basic_block(current_fn, "cons_merge");
+                let result = self.cons_into_lisp_val(new_cons)?;
 
-                self.builder.build_conditional_branch(is_nil, nil_bb, list_bb)?;
+                // Cons cell now owns references to both new_elem_expr and tail_expr
+                // Don't decref them - they're now owned by the cons cell
 
-                // Nil case: tail should be null pointer
-                self.builder.position_at_end(nil_bb);
-                let new_cons_nil = self.alloc_cons_cell()?;
-                self.cons_set_head(new_cons_nil, new_elem_expr)?;
-                let null_ptr = self.ctx.ptr_type(AddressSpace::default()).const_null();
-                self.cons_set_tail(new_cons_nil, null_ptr)?;
-                let result_nil = self.cons_into_lisp_val(new_cons_nil)?;
-                self.builder.build_unconditional_branch(merge_bb)?;
-                let nil_bb_end = self.builder.get_insert_block().unwrap();
-
-                // List case: tail should point to existing cons cell
-                self.builder.position_at_end(list_bb);
-                let cons_cell_ptr = self.unbox_list(list_expr)?;
-                let new_cons_list = self.alloc_cons_cell()?;
-                self.cons_set_head(new_cons_list, new_elem_expr)?;
-                self.cons_set_tail(new_cons_list, cons_cell_ptr)?;
-                let result_list = self.cons_into_lisp_val(new_cons_list)?;
-                self.builder.build_unconditional_branch(merge_bb)?;
-                let list_bb_end = self.builder.get_insert_block().unwrap();
-
-                // Merge
-                self.builder.position_at_end(merge_bb);
-                let phi = self.builder.build_phi(self.ctx.ptr_type(AddressSpace::default()), "cons_result_phi")?;
-                phi.add_incoming(&[(&result_nil, nil_bb_end), (&result_list, list_bb_end)]);
-
-                Ok(phi.as_basic_value().into_pointer_value())
+                Ok(result)
             },
             _ => bail!("cons expects 2 arguments!")
         }
@@ -1233,11 +1192,24 @@ fn lisp_val_to_string(lisp_val_ptr: *mut LispValLayout) -> Result<String> {
             let mut cons_cell_maybe = unsafe { cons_cell.as_ref()};
             let mut list_contents = vec![];
             while let Some(cons_cell_ref) = cons_cell_maybe {
-        
+
                 let current_str = lisp_val_to_string(cons_cell_ref.head)?;
                 list_contents.push(current_str);
 
-                cons_cell_maybe = unsafe { cons_cell_ref.tail.as_ref()};
+                // Tail is now a LispVal, check if it's another list or nil
+                let tail_lisp_val = unsafe { cons_cell_ref.tail.as_ref() };
+                if let Some(tail_val) = tail_lisp_val {
+                    if tail_val.tag == TAG_LIST {
+                        // Extract the cons cell from the tail LispVal
+                        let next_cons_cell = cons_cell_ptr_from_data_ptr(tail_val.data);
+                        cons_cell_maybe = unsafe { next_cons_cell.as_ref() };
+                    } else {
+                        // Tail is nil or something else, stop iteration
+                        cons_cell_maybe = None;
+                    }
+                } else {
+                    cons_cell_maybe = None;
+                }
             }
 
             Ok(format!("({})", list_contents.join(" ")))
@@ -1346,10 +1318,12 @@ impl<'ctx> CodeGen<'ctx> {
         let arg1 = self.emit_expr(&args[1])?;
 
         // TODO - how about non-int values?
-        let arg0 = self.unbox_int(arg0)?;
-        let arg1 = self.unbox_int(arg1)?;
+        let int0 = self.unbox_int(arg0)?;
+        let int1 = self.unbox_int(arg1)?;
 
-        let comp_result = self.builder.build_int_compare(IntPredicate::EQ, arg0, arg1, "int_eq")?;
+        let comp_result = self.builder.build_int_compare(IntPredicate::EQ, int0, int1, "int_eq")?;
+        self.emit_decref(arg0)?;
+        self.emit_decref(arg1)?;
         self.box_bool(comp_result)
     }
 
@@ -1360,10 +1334,12 @@ impl<'ctx> CodeGen<'ctx> {
         let arg0 = self.emit_expr(&args[0])?;
         let arg1 = self.emit_expr(&args[1])?;
 
-        let arg0 = self.unbox_int(arg0)?;
-        let arg1 = self.unbox_int(arg1)?;
+        let int0 = self.unbox_int(arg0)?;
+        let int1 = self.unbox_int(arg1)?;
 
-        let comp_result = self.builder.build_int_compare(IntPredicate::NE, arg0, arg1, "int_ne")?;
+        let comp_result = self.builder.build_int_compare(IntPredicate::NE, int0, int1, "int_ne")?;
+        self.emit_decref(arg0)?;
+        self.emit_decref(arg1)?;
         self.box_bool(comp_result)
     }
 
@@ -1374,10 +1350,12 @@ impl<'ctx> CodeGen<'ctx> {
         let arg0 = self.emit_expr(&args[0])?;
         let arg1 = self.emit_expr(&args[1])?;
 
-        let arg0 = self.unbox_int(arg0)?;
-        let arg1 = self.unbox_int(arg1)?;
+        let int0 = self.unbox_int(arg0)?;
+        let int1 = self.unbox_int(arg1)?;
 
-        let comp_result = self.builder.build_int_compare(IntPredicate::SLT, arg0, arg1, "int_lt")?;
+        let comp_result = self.builder.build_int_compare(IntPredicate::SLT, int0, int1, "int_lt")?;
+        self.emit_decref(arg0)?;
+        self.emit_decref(arg1)?;
         self.box_bool(comp_result)
     }
 
@@ -1388,10 +1366,12 @@ impl<'ctx> CodeGen<'ctx> {
         let arg0 = self.emit_expr(&args[0])?;
         let arg1 = self.emit_expr(&args[1])?;
 
-        let arg0 = self.unbox_int(arg0)?;
-        let arg1 = self.unbox_int(arg1)?;
+        let int0 = self.unbox_int(arg0)?;
+        let int1 = self.unbox_int(arg1)?;
 
-        let comp_result = self.builder.build_int_compare(IntPredicate::SGT, arg0, arg1, "int_gt")?;
+        let comp_result = self.builder.build_int_compare(IntPredicate::SGT, int0, int1, "int_gt")?;
+        self.emit_decref(arg0)?;
+        self.emit_decref(arg1)?;
         self.box_bool(comp_result)
     }
 
@@ -1402,10 +1382,12 @@ impl<'ctx> CodeGen<'ctx> {
         let arg0 = self.emit_expr(&args[0])?;
         let arg1 = self.emit_expr(&args[1])?;
 
-        let arg0 = self.unbox_int(arg0)?;
-        let arg1 = self.unbox_int(arg1)?;
+        let int0 = self.unbox_int(arg0)?;
+        let int1 = self.unbox_int(arg1)?;
 
-        let comp_result = self.builder.build_int_compare(IntPredicate::SLE, arg0, arg1, "int_le")?;
+        let comp_result = self.builder.build_int_compare(IntPredicate::SLE, int0, int1, "int_le")?;
+        self.emit_decref(arg0)?;
+        self.emit_decref(arg1)?;
         self.box_bool(comp_result)
     }
 
@@ -1416,10 +1398,12 @@ impl<'ctx> CodeGen<'ctx> {
         let arg0 = self.emit_expr(&args[0])?;
         let arg1 = self.emit_expr(&args[1])?;
 
-        let arg0 = self.unbox_int(arg0)?;
-        let arg1 = self.unbox_int(arg1)?;
+        let int0 = self.unbox_int(arg0)?;
+        let int1 = self.unbox_int(arg1)?;
 
-        let comp_result = self.builder.build_int_compare(IntPredicate::SGE, arg0, arg1, "int_ge")?;
+        let comp_result = self.builder.build_int_compare(IntPredicate::SGE, int0, int1, "int_ge")?;
+        self.emit_decref(arg0)?;
+        self.emit_decref(arg1)?;
         self.box_bool(comp_result)
     }
 }

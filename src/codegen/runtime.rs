@@ -1,5 +1,5 @@
 use std::{collections::HashMap, ptr};
-mod garbage_collector;
+pub mod garbage_collector;
 
 pub const TAG_INT: u8 = 0;
 pub const TAG_BOOL: u8 = 1;
@@ -31,7 +31,7 @@ pub struct LispValLayout {
 #[repr(C)]
 pub struct ConsCellLayout {
     pub(crate) head: *mut LispValLayout,
-    pub(crate) tail: *mut ConsCellLayout,
+    pub(crate) tail: *mut LispValLayout,  // Changed: tail is now a LispVal (list or nil), not raw ConsCell
 }
 
 #[unsafe(no_mangle)]
@@ -130,31 +130,33 @@ fn free_lisp_val(val: *mut LispValLayout) {
             if !str_ptr.is_null() {
                 let _ = unsafe { std::ffi::CString::from_raw(str_ptr as *mut i8) };
             }
+            // Note: LispVal wrapper is freed by caller (lisp_val_decref)
         }
         TAG_LIST => {
-            let mut list = unsafe { (*val).data as *mut ConsCellLayout };
-            while !list.is_null() {
-                let next = unsafe { (*list).tail };
+            let cons_cell = unsafe { (*val).data as *mut ConsCellLayout };
+            if !cons_cell.is_null() {
+                // Decref head and tail (both are LispVals now)
+                let head = unsafe { (*cons_cell).head };
+                let tail = unsafe { (*cons_cell).tail };
 
-                // decref the head element
-                let head = unsafe { (*list).head };
                 lisp_val_decref(head);
-                // free actual list
-                drop(unsafe { Box::from_raw(list) });
+                lisp_val_decref(tail);  // Tail is now a LispVal, will recursively free if rc=0
 
-                list = next;
+                // Free only this cons cell
+                drop(unsafe { Box::from_raw(cons_cell) });
             }
+            // Note: LispVal wrapper is freed by caller (lisp_val_decref)
         }
         TAG_LAMBDA => {
             // TODO - double check we don't allocate anything in lambdas for now (until we implement lexical closures at least!)
-            // free actual LispVal
-            drop(unsafe { Box::from_raw(val) });
+            // Note: LispVal wrapper is freed by caller (lisp_val_decref)
         }
         TAG_INT | TAG_BOOL | TAG_NIL => {
             // No internal data to free
+            // Note: LispVal wrapper is freed by caller (lisp_val_decref)
         }
         _ => {
-            eprintln!("Warning: Unknown tag {} in free_lisp_val", tag);
+            panic!("FATAL: Attempted to free LispVal with unknown tag {}", tag);
         }
     }
 }
@@ -363,23 +365,48 @@ mod tests {
             (*val3).data = 3;
         }
 
-        // Build cons cells: 3 -> 2 -> 1
+        // Build cons cells from right to left: (1 2 3) = cons(1, cons(2, cons(3, nil)))
+
+        // Create nil for the tail of cell3
+        let nil_val = alloc_lisp_val();
+        unsafe {
+            (*nil_val).tag = TAG_NIL;
+            (*nil_val).data = 0;
+        }
+
+        // Cell3 with nil tail
         let cell3 = alloc_cons_cell();
         unsafe {
             (*cell3).head = val3;
-            (*cell3).tail = ptr::null_mut();
+            (*cell3).tail = nil_val;  // Tail is now a LispVal
         }
 
+        // Wrap cell3 in a LispVal for cell2's tail
+        let cell3_lisp_val = alloc_lisp_val();
+        unsafe {
+            (*cell3_lisp_val).tag = TAG_LIST;
+            (*cell3_lisp_val).data = cell3 as i64;
+        }
+
+        // Cell2 with cell3_lisp_val as tail
         let cell2 = alloc_cons_cell();
         unsafe {
             (*cell2).head = val2;
-            (*cell2).tail = cell3;
+            (*cell2).tail = cell3_lisp_val;  // Tail is a LispVal
         }
 
+        // Wrap cell2 in a LispVal for cell1's tail
+        let cell2_lisp_val = alloc_lisp_val();
+        unsafe {
+            (*cell2_lisp_val).tag = TAG_LIST;
+            (*cell2_lisp_val).data = cell2 as i64;
+        }
+
+        // Cell1 with cell2_lisp_val as tail
         let cell1 = alloc_cons_cell();
         unsafe {
             (*cell1).head = val1;
-            (*cell1).tail = cell2;
+            (*cell1).tail = cell2_lisp_val;  // Tail is a LispVal
         }
 
         let list_val = alloc_lisp_val();
