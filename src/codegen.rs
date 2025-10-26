@@ -1,61 +1,13 @@
 use std::{collections::HashMap, ffi::CStr, os::raw::c_char, slice, sync::atomic};
 
-use inkwell::{builder::Builder, context::Context, execution_engine::{ExecutionEngine, JitFunction}, module::Module, types::StructType, values::{FunctionValue, IntValue, PointerValue}, AddressSpace, IntPredicate};
+use inkwell::{builder::Builder, context::Context, execution_engine::{ExecutionEngine, JitFunction}, module::Module, types::{PointerType, StructType}, values::{BasicMetadataValueEnum, FunctionValue, IntValue, PointerValue}, AddressSpace, IntPredicate};
 use anyhow::{anyhow, bail, Result};
+#[cfg(target_pointer_width = "64")]
+use runtime::ConsCellLayout;
 use crate::parser::SExpr;
+mod runtime;
+use runtime::{alloc_cons_cell, alloc_lisp_val, alloc_string, lisp_val_decref, lisp_val_incref, runtime_get_var, runtime_set_var, LispValLayout, TAG_BOOL, TAG_INT, TAG_LAMBDA, TAG_LIST, TAG_NIL, TAG_STRING};
 
-
-//TODO - move to runtime.rs ?
-
-#[unsafe(no_mangle)]
-pub extern "C" fn runtime_get_var(
-    env_ptr: *mut std::ffi::c_void,
-    name_ptr: *const std::os::raw::c_char
-) -> *mut LispValLayout {
-    unsafe {
-        let env = &*(env_ptr as *mut HashMap<String, *mut LispValLayout>);
-        let name = std::ffi::CStr::from_ptr(name_ptr)
-            .to_str(); //TODO - check errors?
-        if let Ok(name) = name {
-            env.get(name).copied().unwrap_or(std::ptr::null_mut())
-
-        } else {
-            std::ptr::null_mut()
-        }
-
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn runtime_set_var(
-    env_ptr: *mut std::ffi::c_void,
-    name_ptr: *const std::os::raw::c_char,
-    value_ptr: *mut LispValLayout
-) {
-    unsafe {
-        let env = &mut *(env_ptr as *mut HashMap<String, *mut LispValLayout>);
-        let name = std::ffi::CStr::from_ptr(name_ptr)
-            .to_str(); //TODO - check errors?
-        if let Ok(name) = name {
-            env.insert(name.to_string(), value_ptr);
-
-        } 
-
-    }
-}
-
-#[repr(C)]
-pub struct LispValLayout {
-    tag: u8,
-    _padding: [u8; 7],  // Explicit padding to align the next field to 8 bytes
-    data: i64,
-}
-
-#[repr(C)]
-pub struct ConsCellLayout {
-    head: *mut LispValLayout,  
-    tail: *mut ConsCellLayout,
-}
 
 pub struct CodeGen<'ctx> {
     ctx: &'ctx Context,
@@ -68,9 +20,16 @@ pub struct CodeGen<'ctx> {
     //Cons cell type for constructing lisp lists
     cons_cell_type: StructType<'ctx>,
 
+    //handle to ptr_type, because it's used all over the place
+    ptr_type: PointerType<'ctx>,
+
     //necessary Runtime functions (malloc, free, etc.)
-    malloc_fn: FunctionValue<'ctx>,
-    free_fn: FunctionValue<'ctx>,
+    alloc_lisp_val_fn: FunctionValue<'ctx>,
+    alloc_cons_cell_fn: FunctionValue<'ctx>,
+    alloc_string_fn: FunctionValue<'ctx>,
+    incref_fn: FunctionValue<'ctx>,
+    decref_fn: FunctionValue<'ctx>,
+
     memcpy_fn: FunctionValue<'ctx>,
 
     //variables in current scope, dummy environment
@@ -86,12 +45,6 @@ pub struct CodeGen<'ctx> {
 
 }
 
-const TAG_INT: u8 = 0;
-const TAG_BOOL: u8 = 1;
-const TAG_STRING: u8 = 2;
-const TAG_LIST: u8 = 3;
-const TAG_NIL: u8 = 4;
-const TAG_LAMBDA: u8 = 5;
 
 impl<'ctx> CodeGen<'ctx> {
    
@@ -103,23 +56,11 @@ impl<'ctx> CodeGen<'ctx> {
         // Ptr type
         let ptr_type = ctx.ptr_type(AddressSpace::default());
 
-
-        // ┌─────────────────┐
-        // │ LispVal         │
-        // ├─────────────────┤
-        // │ tag: u8         │ ← Type discriminator (0=Int, 1=Bool, 2=String, 3=List, etc.)
-        // │ data: union {   │
-        // │   i32           │
-        // │   bool          │
-        // │   ptr (String)  │
-        // │   ptr (List)    │
-        // │ }               │
-        // └─────────────────┘
-
         let lisp_val_type = ctx.opaque_struct_type("LispVal");
         lisp_val_type.set_body(&[
             ctx.i8_type().into(), // tag
-            ctx.i64_type().into() // union { i32, bool, ptr(String), ptr(List)}
+            ctx.i64_type().into(), // union { i32, bool, ptr(String), ptr(List)}
+            ctx.i32_type().into() // reference count
         ], false);
 
         let cons_cell_type = ctx.opaque_struct_type("ConsCell");
@@ -128,13 +69,16 @@ impl<'ctx> CodeGen<'ctx> {
             ptr_type.into()
         ], false);
 
-        //Declare malloc: i64 -> i8*
-        let malloc_fn_type = ptr_type.fn_type(&[ctx.i64_type().into()], false);
-        let malloc_fn = module.add_function("malloc", malloc_fn_type, None);
+        //Declare alloc_* fns for LispVal, ConsCell, string etc.
+        let alloc_lisp_val_type = ptr_type.fn_type(&[], false);
+        let alloc_lisp_val_fn = module.add_function("alloc_lisp_val", alloc_lisp_val_type, None);
 
-        //Declare free: i8 -> void
-        let free_fn_type = ptr_type.fn_type(&[ptr_type.into()], false);
-        let free_fn = module.add_function("free", free_fn_type, None);
+        let calloc_cons_cell_type = ptr_type.fn_type(&[], false);
+        let alloc_cons_cell_fn = module.add_function("alloc_cons_cell", calloc_cons_cell_type, None);
+
+        let alloc_string_type = ptr_type.fn_type(&[ctx.i64_type().into()], false);
+        let alloc_string_fn = module.add_function("alloc_string", alloc_string_type, None);
+
 
         // Declare memcpy: (i8* dest, i8* src, i64 size) -> i8*
         // void* memcpy(void* dest, const void* src, size_t n)
@@ -145,14 +89,25 @@ impl<'ctx> CodeGen<'ctx> {
         ], false);
         let memcpy = module.add_function("memcpy", memcpy_fn_type, None);
 
+        let incref_type =  ctx.void_type().fn_type(&[ptr_type.into()], false);
+        let incref_fn = module.add_function("lisp_val_incref", incref_type, None);
+
+        let decref_type = ctx.void_type().fn_type(&[ptr_type.into()], false);
+        let decref_fn = module.add_function("lisp_val_decref", decref_type, None);
+
+
         let mut c =Self {
             ctx,
             module,
             builder,
+            ptr_type,
             lisp_val_type,
             cons_cell_type,
-            malloc_fn,
-            free_fn,
+            alloc_lisp_val_fn,
+            alloc_cons_cell_fn,
+            alloc_string_fn,
+            incref_fn,
+            decref_fn,
             memcpy_fn: memcpy,
             local_env: HashMap::new(),
             current_function: None,
@@ -267,8 +222,9 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
 
+    // TODO = move this to CodeGen::new so we can store handled to FunctionValues in self
     fn declare_runtime_functions(&mut self) {
-        let ptr_type = self.ctx.ptr_type(AddressSpace::default());
+        let ptr_type = self.ptr_type;
         
         //declare fn: ptr runtime_get_var(ptr env, ptr name)
         let get_var_type = ptr_type.fn_type(
@@ -287,6 +243,18 @@ impl<'ctx> CodeGen<'ctx> {
 
         self.module.add_function("runtime_set_var", set_var_type, None);
     }
+
+    fn emit_incref(&mut self, val: PointerValue<'ctx>) -> Result<()> {
+        self.builder.build_call(self.incref_fn, &[val.into()], "incref_call")?;
+        Ok(())
+    }
+
+    fn emit_decref(&mut self, val: PointerValue<'ctx>) -> Result<()> {
+        self.builder.build_call(self.decref_fn, &[val.into()], "incref_call")?;
+        Ok(())
+    }
+
+
 
     fn create_execution_engine(&mut self) -> Result<ExecutionEngine<'ctx>> {
         self.module.create_jit_execution_engine(inkwell::OptimizationLevel::None)
@@ -321,6 +289,32 @@ impl<'ctx> CodeGen<'ctx> {
             &set_var_fn,
             runtime_set_var as usize
         );  
+
+        engine.add_global_mapping(
+            &self.incref_fn,
+            lisp_val_incref as usize
+            );
+
+        engine.add_global_mapping(
+            &self.decref_fn,
+            lisp_val_decref as usize
+        );
+
+        // Map allocation functions
+        engine.add_global_mapping(
+            &self.alloc_lisp_val_fn,
+            alloc_lisp_val as usize
+        );
+
+        engine.add_global_mapping(
+            &self.alloc_cons_cell_fn,
+            alloc_cons_cell as usize
+        );
+
+        engine.add_global_mapping(
+            &self.alloc_string_fn,
+            alloc_string as usize
+        );
 
         Ok(engine)
     }
@@ -361,8 +355,9 @@ impl<'ctx> CodeGen<'ctx> {
 
 fn emit_var_lookup(&mut self, id: &String) -> std::result::Result<PointerValue<'ctx>, anyhow::Error> {
         // first check in local env
-        if let Some(val) = self.local_env.get(id) {
-            return Ok(*val)
+        if let Some(&val) = self.local_env.get(id) {
+            self.emit_incref(val)?;
+            return Ok(val)
         }
         let ptr_type = self.ctx.ptr_type(AddressSpace::default());
         // create a pointer to Rust's self.runtime_env
@@ -393,6 +388,9 @@ fn emit_var_lookup(&mut self, id: &String) -> std::result::Result<PointerValue<'
             .into_pointer_value();
         // TODO - build null check 
         let is_null = self.builder.build_is_null(result, "is_get_var_result_null")?;
+
+
+        self.emit_incref(result)?;
         Ok(result)
     }
 
@@ -479,28 +477,38 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
     }
 
 
-    fn call_malloc(&self, size: IntValue<'ctx>) -> Result<PointerValue<'ctx>> {
+    fn call_alloc_fn(&self, alloc_fn: FunctionValue<'ctx>, args: &[BasicMetadataValueEnum<'ctx>]) -> Result<PointerValue<'ctx>> {
         let ptr = self.builder
-        .build_call(self.malloc_fn, &[size.into()], "malloc")?.try_as_basic_value()
-        .left().ok_or(anyhow!("Failed to call malloc"))?;
-
+            .build_call(alloc_fn,  args, "call_alloc_fn")?.try_as_basic_value()
+            .left()
+            .ok_or(anyhow!("Failed to call call_alloc_fn" ))?;
+    
         let val_ptr = self.builder
             .build_pointer_cast(ptr.into_pointer_value(), 
-                self.ctx.ptr_type(AddressSpace::default()), 
+                self.ptr_type, 
                 "cast_to_ptr")?;
-
+    
          Ok(val_ptr)   
     }
-
+    
     //Allocate a LispVal on the heap and return a pointer to it
     fn alloc_lisp_val(&self) -> Result<PointerValue<'ctx>> {
-        let size = self.lisp_val_type.size_of().ok_or(anyhow!("Failed to get LispVal size!"))?;
-        self.call_malloc(size)     
+        let val_ptr = self.call_alloc_fn(self.alloc_lisp_val_fn, &[])?;
+    
+         Ok(val_ptr)   
+
     }
 
     fn alloc_cons_cell(&self) -> Result<PointerValue<'ctx>>  { 
-        let size = self.cons_cell_type.size_of().ok_or(anyhow!("Failed to get ConsCell size!"))?;
-        self.call_malloc(size)
+        let val_ptr = self.call_alloc_fn(self.alloc_cons_cell_fn, &[])?;
+    
+        Ok(val_ptr)   
+    }
+
+    fn alloc_string(&self, size: IntValue<'ctx>) -> Result<PointerValue<'ctx>>  { 
+        let val_ptr = self.call_alloc_fn(self.alloc_string_fn, &[size.into()])?;
+    
+        Ok(val_ptr)   
     }
 
     fn box_int(&mut self, value: IntValue<'ctx>) -> Result<PointerValue<'ctx>> {
@@ -544,7 +552,7 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         let str_len = value.len() + 1; //+1 for null
         let str_size = self.ctx.i64_type().const_int(str_len as u64, false);
 
-        let str_ptr = self.call_malloc(str_size)?;
+        let str_ptr = self.alloc_string(str_size)?;
 
         // Create a global constant for the source string, as it will come from literal values in source code (list "a" )
         // This creates a read-only string in the data section
@@ -680,7 +688,7 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         let size_with_null = self.builder.build_int_add(length, one, "size_with_null")?;
         
         let dest_ptr = self.builder.build_call(
-            self.malloc_fn,
+            self.alloc_lisp_val_fn,
             &[size_with_null.into()],
             "malloc_str"
         )?.try_as_basic_value()
@@ -1260,10 +1268,12 @@ impl<'ctx> CodeGen<'ctx> {
         let arg0 = self.emit_expr(&args[0])?;
         let arg1 = self.emit_expr(&args[1])?;
 
-        let arg0 = self.unbox_int(arg0)?;
-        let arg1 = self.unbox_int(arg1)?;
+        let int0 = self.unbox_int(arg0)?;
+        let int1 = self.unbox_int(arg1)?;
 
-        let result = self.builder.build_int_add(arg0, arg1, "builtin_addint")?;
+        let result = self.builder.build_int_add(int0, int1, "builtin_addint")?;
+        self.emit_decref(arg0)?;
+        self.emit_decref(arg1)?;
         self.box_int(result)
     }
 
@@ -1276,11 +1286,14 @@ impl<'ctx> CodeGen<'ctx> {
         let arg0 = self.emit_expr(&args[0])?;
 
 
-        let arg0 = self.unbox_int(arg0)?;
-        let arg1 = self.unbox_int(arg1)?;
+        let int0 = self.unbox_int(arg0)?;
+        let int1 = self.unbox_int(arg1)?;
 
 
-        let result = self.builder.build_int_sub(arg0, arg1, "builtin_subint")?;
+        let result = self.builder.build_int_sub(int0, int1, "builtin_subint")?;
+        self.emit_decref(arg0)?;
+        self.emit_decref(arg1)?;
+
         self.box_int(result)
     }
 
@@ -1294,11 +1307,13 @@ impl<'ctx> CodeGen<'ctx> {
         let arg0 = self.emit_expr(&args[0])?;
 
 
-        let arg0 = self.unbox_int(arg0)?;
-        let arg1 = self.unbox_int(arg1)?;
+        let int0 = self.unbox_int(arg0)?;
+        let int1 = self.unbox_int(arg1)?;
 
 
-        let result = self.builder.build_int_mul(arg0, arg1, "builtin_mulint")?;
+        let result = self.builder.build_int_mul(int0, int1, "builtin_mulint")?;
+        self.emit_decref(arg0)?;
+        self.emit_decref(arg1)?;
         self.box_int(result)
     }
 
@@ -1311,11 +1326,14 @@ impl<'ctx> CodeGen<'ctx> {
         let arg1 = self.emit_expr(&args[1])?;
         let arg0 = self.emit_expr(&args[0])?;
 
-        let arg0 = self.unbox_int(arg0)?;
-        let arg1 = self.unbox_int(arg1)?;
+        let int0 = self.unbox_int(arg0)?;
+        let int1 = self.unbox_int(arg1)?;
 
 
-        let result = self.builder.build_int_signed_div(arg0, arg1, "builtin_divint")?;
+        let result = self.builder.build_int_signed_div(int0, int1, "builtin_divint")?;
+
+        self.emit_decref(arg0)?;
+        self.emit_decref(arg1)?;
         self.box_int(result)
     }
 
@@ -1608,7 +1626,7 @@ mod codegen_tests {
     }
 
     #[test]
-    fn scalar_bool_expr() {
+    fn test_bool_expr() {
         let ctx = Context::create();
         let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
 
@@ -1627,7 +1645,7 @@ mod codegen_tests {
     }
 
     #[test]
-    fn integer_math() {
+    fn test_integer_math() {
         let ctx = Context::create();
         let mut compiler = CodeGen::new(&ctx, DEBUG_MODE);
 

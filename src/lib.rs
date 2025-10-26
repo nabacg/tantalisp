@@ -56,7 +56,7 @@ impl<'l> Tantalisp<'l> {
         println!("Mode: {} | Debug: {}", mode, debug);
 
         // Load prelude (standard library)
-        self.load_prelude()?;
+        //self.load_prelude()?;
 
         println!("Type expressions to evaluate.");
         println!("Exit: Ctrl+C, Ctrl+D, or type :quit");
