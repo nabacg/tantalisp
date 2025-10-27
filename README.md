@@ -28,6 +28,49 @@ A JIT-compiled Lisp interpreter written in Rust with LLVM backend via Inkwell.
 - LLVM 18.x
 - Cargo
 
+#### Installing LLVM 18+
+
+**macOS (Homebrew - Recommended):**
+
+```bash
+brew install llvm
+```
+
+Homebrew typically installs the latest LLVM (18+) which is compatible. No environment variables needed - Inkwell will automatically find it via Homebrew paths.
+
+**Linux (Ubuntu/Debian):**
+
+```bash
+wget https://apt.llvm.org/llvm.sh
+chmod +x llvm.sh
+sudo ./llvm.sh 18
+```
+
+**Linux (Fedora/RHEL):**
+
+```bash
+sudo dnf install llvm llvm-devel
+```
+
+**Linux (Arch):**
+
+```bash
+sudo pacman -S llvm
+```
+
+**Verify installation:**
+
+```bash
+llvm-config --version  # Should show 18.x or higher
+```
+
+**Note:** The project uses LLVM 18 via Inkwell, but LLVM 18-20 are all compatible. If you encounter issues finding LLVM, you can explicitly set:
+
+```bash
+export LLVM_SYS_180_PREFIX="$(brew --prefix llvm)"  # macOS
+export LLVM_SYS_180_PREFIX="/usr/lib/llvm-18"       # Linux
+```
+
 ### Build
 
 ```bash
