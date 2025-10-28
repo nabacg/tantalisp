@@ -1,0 +1,9 @@
+(def div2-iter (fn [n acc]
+  (if (<= n 1)
+    acc
+    (div2-iter (- n 2) (+ acc 1)))))
+
+(def div2 (fn [n]
+  (div2-iter n 0)))
+
+(div2 1000000)

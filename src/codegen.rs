@@ -268,7 +268,7 @@ impl<'ctx> CodeGen<'ctx> {
 
 
     fn create_execution_engine(&mut self) -> Result<ExecutionEngine<'ctx>> {
-        self.module.create_jit_execution_engine(inkwell::OptimizationLevel::None)
+        self.module.create_jit_execution_engine(inkwell::OptimizationLevel::Aggressive)
                 .map_err(|e| anyhow!("Failed to create JIT execution engine: {}", e))
     }
 
@@ -278,7 +278,7 @@ impl<'ctx> CodeGen<'ctx> {
         let module_clone = self.module.clone();
 
         // Create execution engine from the clone
-        let  engine = module_clone.create_jit_execution_engine(inkwell::OptimizationLevel::None)
+        let  engine = module_clone.create_jit_execution_engine(inkwell::OptimizationLevel::Aggressive)
             .map_err(|e| anyhow!("Failed to create JIT execution engine: {}", e))?;
 
         // Register our runtime helper functions with the JIT
