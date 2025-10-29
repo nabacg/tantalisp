@@ -1,0 +1,25 @@
+(def listn (fn [n]
+  (if (= n 0)
+    '()
+    (cons n (listn (- n 1))))))
+
+(def shorterp (fn [x y]
+  (if y
+    (if x
+      (shorterp (cdr x) (cdr y))
+      :true)
+    :false)))
+
+(def mas (fn [x y z]
+  (if (shorterp y x)
+    (mas
+      (mas (cdr x) y z)
+      (mas (cdr y) z x)
+      (mas (cdr z) x y))
+    z)))
+
+(def l6 (listn 6))
+(def l4 (listn 4))
+(def l2 (listn 2))
+
+(mas l6 l4 l2)

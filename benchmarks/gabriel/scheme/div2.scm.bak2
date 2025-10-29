@@ -1,0 +1,14 @@
+#!/usr/bin/env racket
+#lang racket
+
+;;; DIV2 benchmark for Scheme (Racket, Chicken, Guile)
+
+(define (div2-iter n acc)
+  (if (<= n 1)
+      acc
+      (div2-iter (- n 2) (+ acc 1))))
+
+(define (div2 n)
+  (div2-iter n 0))
+
+(div2 1000000)

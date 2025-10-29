@@ -1,0 +1,14 @@
+Implementation,Benchmark,Time(ms),Result
+Racket,TAK,348,7
+Racket,DIV2,348,500000
+Racket,TRIANG,345,5050
+Racket,FIB,356,1346269
+Racket,TAKL,347,(7654321)
+Clojure,TAK,886,7
+Clojure,DIV2,885,500000
+Clojure,TRIANG,875,5050
+Clojure,FIB,903,1346269
+Clojure,TAKL,925,(7654321)
+Tantalisp,TAK,391,7
+Tantalisp,TRIANG,379,5050
+Tantalisp,FIB,1188,1346269

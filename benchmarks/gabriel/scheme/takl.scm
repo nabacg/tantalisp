@@ -1,0 +1,27 @@
+#!/usr/bin/env racket
+#lang racket
+
+(define (listn n)
+  (if (= n 0)
+      '()
+      (cons n (listn (- n 1)))))
+
+(define (shorterp x y)
+  (if (pair? y)
+      (if (pair? x)
+          (shorterp (cdr x) (cdr y))
+          #t)
+      #f))
+
+(define (mas x y z)
+  (if (shorterp y x)
+      (mas (mas (cdr x) y z)
+           (mas (cdr y) z x)
+           (mas (cdr z) x y))
+      z))
+
+(define l18 (listn 18))
+(define l12 (listn 12))
+(define l6 (listn 6))
+
+(displayln (mas l18 l12 l6))
