@@ -2,6 +2,7 @@ mod lexer;
 mod parser;
 mod evaluator;
 mod codegen;
+mod ir;
 
 
 use anyhow::{anyhow, Result};
