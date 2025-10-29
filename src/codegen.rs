@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::CStr, os::raw::c_char, slice, sync::atomic};
+use std::{collections::HashMap, ffi::CStr, os::raw::c_char, slice, sync::atomic::{self, AtomicI32, Ordering}};
 
 use inkwell::{builder::Builder, context::Context, execution_engine::{ExecutionEngine, JitFunction}, module::Module, types::{PointerType, StructType}, values::{BasicMetadataValueEnum, FunctionValue, IntValue, PointerValue}, AddressSpace, IntPredicate};
 use anyhow::{anyhow, bail, Result};
@@ -44,7 +44,7 @@ pub struct CodeGen<'ctx> {
 
     // Runtime symbol table - use raw pointer for stable address
     runtime_env: *mut HashMap<String, *mut LispValLayout>,
-
+    lambda_naming_counter: AtomicI32,
 }
 
 
@@ -118,7 +118,8 @@ impl<'ctx> CodeGen<'ctx> {
             local_env: HashMap::new(),
             current_function: None,
             runtime_env: Box::into_raw(Box::new(HashMap::new())),
-            debug: debug_mode
+            debug: debug_mode,
+            lambda_naming_counter: AtomicI32::new(0)
         };
         c.declare_runtime_functions();
 
@@ -833,7 +834,7 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
 
     fn lisp_val_data(&mut self, lisp_val_ptr: PointerValue<'ctx>) -> Result<IntValue<'ctx>> {
         let int_ptr = self.builder.build_struct_gep(self.lisp_val_type, lisp_val_ptr, 1, "data_ptr")?;
-        let data = self.builder.build_load(self.ctx.i64_type(), int_ptr, "load_string_ptr")?
+        let data = self.builder.build_load(self.ctx.i64_type(), int_ptr, "load_data_ptr_as_int")?
         .into_int_value();
         Ok(data)
     }
@@ -1011,9 +1012,8 @@ fn emit_if(&mut self, pred_expr: &Box<SExpr>, truthy_exprs: &Vec<SExpr>, falsy_e
         let fn_type = ptr_type.fn_type(&param_types, false);
         
         // create function in current module
-        // TODO - should generate unique names for lambdas
-        let fn_name = "lambda_324";
-        let new_lambda = self.module.add_function(fn_name, fn_type, None);
+        let fn_name = format!("lambda_{}", self.lambda_naming_counter.fetch_add(1, Ordering::SeqCst));
+        let new_lambda = self.module.add_function(&fn_name, fn_type, None);
         let entry_bb = self.ctx.append_basic_block(new_lambda, &format!("{}_body", fn_name));
 
 
