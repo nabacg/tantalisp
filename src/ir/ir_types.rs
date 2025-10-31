@@ -1,6 +1,5 @@
 use std::{cmp::Ordering, collections::btree_set::Union, fmt::Display};
 
-use inkwell::types;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SsaId(pub u32);
@@ -41,7 +40,7 @@ pub enum Type {
     // Vector (heap-allocated collection)
     Vector,
     // LispVal struct wrapping dynamic type (heap-allocated)
-    Box, 
+    BoxedLispVal, 
     Function {
         params: Vec<Type>,
         return_type: Box<Type>
@@ -56,7 +55,7 @@ pub enum Type {
 
 impl Type {
     pub fn is_concrete(&self) -> bool {
-        !matches!(self, Type::Any | Type::Bottom)
+        !matches!(self, Type::Any | Type::Bottom | Type::Union(..))
     } 
 
     pub fn needs_rc(&self) -> bool {
@@ -74,7 +73,7 @@ impl Type {
         match (self, other) {
             (_, Any) => true, // everything is a subtype of Any, it's the Top type like Object in Java
             (Bottom, _) => true, // Bottom is a subtype of every type
-            (Int | Bool | String | List | Vector, Box) => true, // concrete types are subtypes of Box
+            (Int | Bool | String | List | Vector, BoxedLispVal) => true, // concrete types are subtypes of Box
             //function subtyping (contravariant in params, covariant in return_type) 
             (Function { params: p1, return_type: r1},
                 Function {params: p2, return_type: r2}) => {
@@ -129,16 +128,6 @@ impl Type {
             (Bottom, ty) | (ty, Bottom) => ty.clone(), 
             // if both are the same type, just return it
             (ty1, ty2) if ty1 == ty2 => ty1.clone(),
-            // for 2 different concrete types, create a Union
-            (ty1, ty2) if ty1.is_concrete() && ty1.is_concrete() => {
-                let mut types = vec![ty1.clone(), ty2.clone()];
-                // Without sorting, these are "different" types:
-                //      Union(Int, String)
-                //      Union(String, Int)
-                types.sort();
-                types.dedup();
-                Union(types)
-            },
             // Simplify unions
             (Union(types1), Union(types2)) => {
                 let mut all_types = types1.clone();
@@ -161,6 +150,16 @@ impl Type {
                 }
                 Union(all_types)
             },
+            // for 2 different concrete types, create a Union
+            (ty1, ty2) if ty1.is_concrete() && ty1.is_concrete() => {
+                let mut types = vec![ty1.clone(), ty2.clone()];
+                // Without sorting, these are "different" types:
+                //      Union(Int, String)
+                //      Union(String, Int)
+                types.sort();
+                types.dedup();
+                Union(types)
+            },
             // finally, need to default to Any if we can't join more precisely 
             _ => Any,
 
@@ -181,7 +180,7 @@ impl Ord for Type {
             (String, String) => Ordering::Equal,
             (List, List) => Ordering::Equal,
             (Vector, Vector) => Ordering::Equal,
-            (Box, Box) => Ordering::Equal,
+            (BoxedLispVal, BoxedLispVal) => Ordering::Equal,
             (Any, Any) => Ordering::Equal,
             (Bottom, Bottom) => Ordering::Equal,
             
@@ -211,8 +210,8 @@ impl Ord for Type {
             (Vector, _) => Ordering::Less,
             (_, Vector) => Ordering::Greater,
             
-            (Box, _) => Ordering::Less,
-            (_, Box) => Ordering::Greater,
+            (BoxedLispVal, _) => Ordering::Less,
+            (_, BoxedLispVal) => Ordering::Greater,
             
             (Function { .. }, _) => Ordering::Less,
             (_, Function { .. }) => Ordering::Greater,
@@ -313,4 +312,136 @@ impl Constant {
             Constant::Unit => Type::Any,  // technically '() is a list? but also acts as bool 
         }
     }
+}
+
+#[cfg(test)] 
+mod ir_types_tests {
+    use super::*;
+
+    #[test]
+    fn test_type_join(){
+        use Type::*;
+        assert_eq!(Union(vec![Int, String]), Union(vec![Int, String]).join(&Int));
+        assert_eq!(Union(vec![Int, String]), Int.join(&Union(vec![Int, String])));
+        assert_eq!(Union(vec![Int, Bool]), Bool.join(&Int));
+        assert_eq!(Union(vec![Int, Bool]), Int.join(&Bool));
+        
+        assert_eq!(Union(vec![Int, Bool, String, Vector, Union(vec![Bool, Vector]) ]), 
+            Union(vec![Int, String, Union(vec![Bool, Vector])])
+                .join(&Union(vec![Vector, Int, Bool ])));
+
+        // .join with Bottom type acts as identity
+        assert_eq!(String, String.join(&Bottom));
+        assert_eq!(String, Bottom.join(&String));
+
+        // Any always dominates teh .join 
+        assert_eq!(Any, Union(vec![Int, String, Union(vec![Bool, Vector])]).join(&Any));
+        assert_eq!(Any, Any.join(&Vector));
+    }
+
+    #[test]
+    pub fn test_is_subtype_of() {
+        use Type::*;
+        // everythign is a subtype of Any
+        assert!(Int.is_subtype_of(&Any));
+        assert!(String.is_subtype_of(&Any));
+        assert!(List.is_subtype_of(&Any));
+        assert!(Union(vec![Int, String]).is_subtype_of(&Any));
+        assert!(Union(vec![Int, String, Union(vec![Bool, Vector])]).is_subtype_of(&Any));
+        
+        // Bottom is a suptype of very type
+        assert!(Bottom.is_subtype_of(&Vector));
+        assert!(Bottom.is_subtype_of(&List));
+        assert!(Bottom.is_subtype_of(&Union(vec![Int, String])));
+        assert!(Bottom.is_subtype_of(&Union(vec![Int, String, Union(vec![Bool, Vector])])));
+        
+
+        // Most types are not subtypes of each other
+        assert!(!Int.is_subtype_of(&String));
+        assert!(!Bool.is_subtype_of(&Vector));
+        assert!(!List.is_subtype_of(&Vector));
+        assert!(!Union(vec![Int]).is_subtype_of(&Vector));
+
+        // same types are subtypes
+        assert!(String.is_subtype_of(&String));
+        assert!(Union(vec![Int, String, Union(vec![Bool, Vector])])
+            .is_subtype_of(&Union(vec![Int, String, Union(vec![Bool, Vector])])));
+        
+        // concrete types are subtypes of Box
+        assert!(Int.is_subtype_of(&BoxedLispVal));
+        assert!(String.is_subtype_of(&BoxedLispVal));
+        assert!(Bool.is_subtype_of(&BoxedLispVal));
+        assert!(List.is_subtype_of(&BoxedLispVal));
+        assert!(Vector.is_subtype_of(&BoxedLispVal));
+        assert!(Int.is_subtype_of(&BoxedLispVal));
+
+
+        // Functions are contravariant in arguments covariant in return types 
+
+        // This is true, because both is true
+        //  - all params of f1 (left) are super types of f2 (right) - contravariant
+        //  - return_type of f1 (left) is a subtype of f2 return_type - covariant
+        // This makes sense because you can use f1 everywhere you could use f2, since
+        //  - it's input params are "more general" (super type) than f2 (here BoxedLispVal vs say Int) 
+        //  meaning each f2 call site must type check ( you can pass Int where BoxedLispVal is required )
+        //  - the f1 return_type is more concrete (subtype) than f2, meaning it can be used as a result in f2 callsite
+        //  you can assing result_type: Int where BoxedLispVal was required 
+        assert!(Function { 
+            params: vec![BoxedLispVal, BoxedLispVal, BoxedLispVal], 
+            return_type: Box::new(Int) 
+        }.is_subtype_of(&Function { 
+            params: vec![Int, String, List], 
+            return_type: Box::new(BoxedLispVal) 
+        }));
+
+        // The opposite relation ship is not true
+        assert!(!Function { params: vec![Int, String, List], return_type: Box::new(BoxedLispVal) }
+        .is_subtype_of(&Function { 
+            params: vec![BoxedLispVal, BoxedLispVal, BoxedLispVal], 
+            return_type: Box::new(Int) 
+        }));
+
+        // same if some (all) of the types match exactly
+        assert!(Function { 
+            params: vec![BoxedLispVal, String, List], 
+            return_type: Box::new(Int) 
+        }.is_subtype_of(&Function { 
+            params: vec![Int, String, List], 
+            return_type: Box::new(BoxedLispVal) 
+        }));
+
+        // exact match is a subtype
+        assert!(Function { 
+            params: vec![Int, String, List], 
+            return_type: Box::new(Int) 
+        }.is_subtype_of(&Function { 
+            params: vec![Int, String, List], 
+            return_type: Box::new(Int) 
+        }));
+
+        // And of course it's false if  param count mismatch
+        assert!(!Function { params: vec![Int, String, List], return_type: Box::new(BoxedLispVal) }
+        .is_subtype_of(&Function { 
+            params: vec![Int], 
+            return_type: Box::new(Int) 
+        }));
+
+        // or if param types don't match
+        assert!(!Function { params: vec![Int, List, List], return_type: Box::new(BoxedLispVal) }
+        .is_subtype_of(&Function { 
+            params: vec![Int, String, List], 
+            return_type: Box::new(Int) 
+        }));
+
+        // or if return_type doesn't check
+        assert!(!Function { 
+            params: vec![Int, String, List], 
+            return_type: Box::new(Int) 
+        }.is_subtype_of(&Function { 
+            params: vec![Int, String, List], 
+            return_type: Box::new(String) 
+        }));
+
+    }   
+
 }
