@@ -577,8 +577,8 @@ mod ir_lowering_tests {
     }
 
     #[test]
-    fn test_types_primop_result() {
-        // (+ 1 2) should produce Int
+    fn test_types_arithmetic_inference() {
+        // (+ 1 2) should infer Type::Int
         let expr = SExpr::List(vec![
             SExpr::Symbol("+".to_string()),
             SExpr::Int(1),
@@ -592,8 +592,143 @@ mod ir_lowering_tests {
         for bb in &toplevel.blocks {
             for inst in &bb.instructions {
                 if let Instruction::PrimOp { dest, op: Operator::Add, .. } = inst {
-                    // Initially it's Type::Any, type inference will refine it
-                    assert!(matches!(dest.ty, Type::Any), "PrimOp dest initially Type::Any");
+                    assert_eq!(dest.ty, Type::Int, "Add with Int args should produce Type::Int");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_types_comparison_inference() {
+        // (= 42 99) should infer Type::Bool
+        let expr = SExpr::List(vec![
+            SExpr::Symbol("=".to_string()),
+            SExpr::Int(42),
+            SExpr::Int(99),
+        ]);
+
+        let ns = lower_expr_to_namespace(&expr).expect("Failed to lower");
+        let toplevel = get_toplevel_function(&ns).expect("No toplevel function");
+
+        // Find PrimOp Eq and check result type
+        for bb in &toplevel.blocks {
+            for inst in &bb.instructions {
+                if let Instruction::PrimOp { dest, op: Operator::Eq, .. } = inst {
+                    assert_eq!(dest.ty, Type::Bool, "Eq should always produce Type::Bool");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_types_nested_arithmetic_inference() {
+        // (+ (* 2 3) (- 10 4))
+        // All operations should infer Int
+        let expr = SExpr::List(vec![
+            SExpr::Symbol("+".to_string()),
+            SExpr::List(vec![
+                SExpr::Symbol("*".to_string()),
+                SExpr::Int(2),
+                SExpr::Int(3),
+            ]),
+            SExpr::List(vec![
+                SExpr::Symbol("-".to_string()),
+                SExpr::Int(10),
+                SExpr::Int(4),
+            ]),
+        ]);
+
+        let ns = lower_expr_to_namespace(&expr).expect("Failed to lower");
+        let toplevel = get_toplevel_function(&ns).expect("No toplevel function");
+
+        // All arithmetic ops should be Type::Int
+        for bb in &toplevel.blocks {
+            for inst in &bb.instructions {
+                if let Instruction::PrimOp { dest, op, .. } = inst {
+                    match op {
+                        Operator::Add | Operator::Mul | Operator::Sub => {
+                            assert_eq!(dest.ty, Type::Int, "{:?} should produce Type::Int", op);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_types_all_comparisons_return_bool() {
+        let ops = vec![
+            ("=", Operator::Eq),
+            ("!=", Operator::Ne),
+            ("<", Operator::Lt),
+            (">", Operator::Gt),
+            ("<=", Operator::Le),
+            (">=", Operator::Ge),
+        ];
+
+        for (op_str, expected_op) in ops {
+            let expr = SExpr::List(vec![
+                SExpr::Symbol(op_str.to_string()),
+                SExpr::Int(1),
+                SExpr::Int(2),
+            ]);
+
+            let ns = lower_expr_to_namespace(&expr)
+                .expect(&format!("Failed to lower {}", op_str));
+            let toplevel = get_toplevel_function(&ns).expect("No toplevel function");
+
+            // Find the comparison op
+            for bb in &toplevel.blocks {
+                for inst in &bb.instructions {
+                    if let Instruction::PrimOp { dest, op, .. } = inst {
+                        if op == &expected_op {
+                            assert_eq!(
+                                dest.ty,
+                                Type::Bool,
+                                "{} should always produce Type::Bool",
+                                op_str
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_types_all_arithmetic_ops_infer_int() {
+        let ops = vec![
+            ("+", Operator::Add),
+            ("-", Operator::Sub),
+            ("*", Operator::Mul),
+            ("/", Operator::Div),
+        ];
+
+        for (op_str, expected_op) in ops {
+            let expr = SExpr::List(vec![
+                SExpr::Symbol(op_str.to_string()),
+                SExpr::Int(10),
+                SExpr::Int(5),
+            ]);
+
+            let ns = lower_expr_to_namespace(&expr)
+                .expect(&format!("Failed to lower {}", op_str));
+            let toplevel = get_toplevel_function(&ns).expect("No toplevel function");
+
+            // Find the arithmetic op
+            for bb in &toplevel.blocks {
+                for inst in &bb.instructions {
+                    if let Instruction::PrimOp { dest, op, .. } = inst {
+                        if op == &expected_op {
+                            assert_eq!(
+                                dest.ty,
+                                Type::Int,
+                                "{} with Int args should produce Type::Int",
+                                op_str
+                            );
+                        }
+                    }
                 }
             }
         }

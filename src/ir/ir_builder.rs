@@ -440,7 +440,14 @@ impl IrLoweringContext {
             .collect();
 
         let arg_vals = arg_vals?;
-        let dest = self.builder.fresh_ssa(Type::Any);
+
+        // Infer result type from operator and argument types
+        let arg_types: Vec<Type> = arg_vals.iter()
+            .map(|id| self.get_ssa_type(*id).unwrap_or(Type::Any))
+            .collect();
+
+        let result_type = prim_op.result_type(&arg_types);
+        let dest = self.builder.fresh_ssa(result_type);
         let dest_id = dest.id;
         let bb = self.current_block()?;
         bb.emit(Instruction::PrimOp { dest: dest, op: prim_op, args: arg_vals });
