@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::ir_types::{BlockId, Constant, FunctionId, PrimOp, SsaId, Type, TypedValue};
+use super::ir_types::{BlockId, Constant, FunctionId, Operator, SsaId, Type, TypedValue};
 
 
 #[derive(Debug, Clone)]
@@ -13,7 +13,7 @@ pub enum Instruction {
     // Primitive (BuiltIn) operations (arithmetic, comparison)
     PrimOp {
         dest: TypedValue,
-        op: PrimOp,
+        op: Operator,
         args: Vec<SsaId>
     },
     // Call a statically known function (call direct, enables inlining)
@@ -202,5 +202,103 @@ impl Namespace {
         let id = f.id;
         self.functions.insert(id, f);
         id
+    }
+}
+
+
+#[cfg(test)]
+mod instructions_tests {
+    use super::*;
+    use Instruction::*;
+
+
+    fn int_val(id: SsaId) -> TypedValue {
+        TypedValue { id, ty: Type::Int }
+    }
+
+    #[test]
+    fn test_compute_predecessors() {
+        let entry_block_id = BlockId(0);
+        let truthy_block_id = BlockId(1);
+        let falsy_block_id = BlockId(2);
+        let merge_block_id = BlockId(3);
+
+        let arg_0 =  SsaId(0);
+        let var_x  = SsaId(1); 
+        let var_cmp =  SsaId(2);
+        let var_t =  SsaId(3);
+        let var_f =  SsaId(4);
+        let ret_var = SsaId(5);
+
+        let merge_bb = BasicBlock {
+            id: merge_block_id,
+            instructions: vec![ 
+                Phi { dest: int_val(ret_var), incoming: vec![
+                    (var_t, truthy_block_id),
+                    (var_f, falsy_block_id)
+                ] }
+            ],
+            terminator: Terminator::Return { value: ret_var },
+            predecessors: vec![]
+        };
+
+        let truthy_bb = BasicBlock { 
+                id: truthy_block_id, 
+                instructions: vec![
+                    Instruction::Const { dest: int_val(var_t), value: Constant::Int(42) }
+                ], 
+                terminator: Terminator::Jump { target: merge_block_id }, 
+                predecessors: vec![] };
+
+        let falsy_bb = BasicBlock { 
+            id: falsy_block_id, 
+            instructions: vec![
+                Instruction::Const { dest: int_val(var_t), value: Constant::Int(-177) }
+            ], 
+            terminator: Terminator::Jump { target: merge_block_id }, 
+            predecessors: vec![] };
+    
+
+        let entry_bb = BasicBlock{
+            id: entry_block_id,
+            instructions: vec![
+                Instruction::Const { dest: int_val(var_x), value: Constant::Int(10) },
+                Instruction::PrimOp { dest: int_val(var_cmp), op: Operator::Eq, args: vec![arg_0, var_x] }
+            ],
+            terminator: Terminator::Branch { condition: var_cmp, truthy_block: truthy_block_id, falsy_block: falsy_block_id },
+            predecessors: vec![],
+        };
+
+        let mut f1 = Function {
+            blocks: vec![entry_bb, truthy_bb, falsy_bb, merge_bb],
+            id: FunctionId(0),
+            name: "f".to_string(),
+            params: vec![ int_val(arg_0) ],
+            return_type: Type::Int,
+            entry_block: entry_block_id,
+        };
+
+        f1.compute_predecessors();
+
+
+        let entry_bb =  f1.find_bloc(entry_block_id).unwrap();
+        assert_eq!(vec![truthy_block_id, falsy_block_id], 
+            entry_bb.terminator.successors());
+
+        assert!(entry_bb.predecessors.is_empty());
+
+        let truthy_bb = f1.find_bloc(truthy_block_id).unwrap();
+        assert_eq!(vec![merge_block_id], truthy_bb.terminator.successors());
+        assert_eq!(vec![entry_block_id], truthy_bb.predecessors);
+
+        let falsy_bb = f1.find_bloc(falsy_block_id).unwrap();
+        assert_eq!(vec![merge_block_id], falsy_bb.terminator.successors());
+        assert_eq!(vec![entry_block_id], falsy_bb.predecessors);
+
+        let merge_bb = f1.find_bloc(merge_block_id).unwrap();
+        assert!(merge_bb.terminator.successors().is_empty()); // function returns here 
+        assert_eq!(vec![truthy_block_id, falsy_block_id], merge_bb.predecessors);
+
+
     }
 }

@@ -229,7 +229,7 @@ impl Ord for Type {
 
 /// Primitive Operations
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PrimOp {
+pub enum Operator {
         // Arithmetic
         Add, Sub, Mul, Div, Mod,
         // Comparisons
@@ -251,10 +251,10 @@ pub enum PrimOp {
         StringLen,
 }
 
-impl PrimOp {
+impl Operator {
     //compute result type of primitive operation
     pub fn result_type(&self, arg_types: &[Type]) -> Type {
-        use PrimOp::*;
+        use Operator::*;
 
         match self {
             Add | Sub | Mul | Div | Mod => {
