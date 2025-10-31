@@ -97,7 +97,7 @@ pub struct IrLoweringContext {
     builder: FunctionIrBuilder,
     env: HashMap<String, SsaId>,
     current_function_id: FunctionId,
-    namespace: Namespace,
+    pub namespace: Namespace,
     current_params: Vec<TypedValue>,
 }
 
