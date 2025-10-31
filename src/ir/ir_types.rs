@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::btree_set::Union, fmt::Display};
+use std::{cmp::Ordering, fmt::Display};
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,6 +25,10 @@ impl Display for BlockId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FunctionId(pub u32);
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SymbolId(pub u32);
 
 // type system 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
@@ -300,7 +304,8 @@ pub enum Constant {
     Int(i32),
     Bool(bool),
     String(String),
-    Unit, //  for empty values, should it be Nil ?
+    Unit, 
+    Nil
 }
 
 impl Constant {
@@ -309,7 +314,8 @@ impl Constant {
             Constant::Int(_) => Type::Int,
             Constant::Bool(_) => Type::Bool,
             Constant::String(_) => Type::String,
-            Constant::Unit => Type::Any,  // technically '() is a list? but also acts as bool 
+            Constant::Unit => Type::Any, 
+            Constant::Nil => Type::List // technically '() is a list? but also acts as bool 
         }
     }
 }

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::ir_types::{BlockId, Constant, FunctionId, Operator, SsaId, Type, TypedValue};
+use super::ir_types::{BlockId, Constant, FunctionId, Operator, SsaId, SymbolId, Type, TypedValue};
 
 
 #[derive(Debug, Clone)]
@@ -27,6 +27,12 @@ pub enum Instruction {
         dest: TypedValue,
         func: SsaId,
         args: Vec<SsaId>
+    },
+    // Make closure (create lambda) - captures environment
+    MakeClosure {
+        dest: TypedValue,
+        func: FunctionId,
+        captures: Vec<SsaId>,
     },
     // Create a vector literal 
     MakeVector {
@@ -57,12 +63,13 @@ impl Instruction {
     pub fn dest(&self) -> Option<&TypedValue> {
         match self {
             Instruction::Const { dest, .. } 
-            | Instruction::PrimOp { dest , ..} 
-            | Instruction::DirectCall { dest, ..} 
-            | Instruction::Call { dest, ..} 
-            | Instruction::MakeVector { dest, .. } 
-            | Instruction::MakeList { dest, ..} 
-            | Instruction::Phi { dest, ..} => Some(dest),
+                    | Instruction::PrimOp { dest , ..} 
+                    | Instruction::DirectCall { dest, ..} 
+                    | Instruction::Call { dest, ..} 
+                    | Instruction::MakeClosure { dest, ..}
+                    | Instruction::MakeVector { dest, .. } 
+                    | Instruction::MakeList { dest, ..} 
+                    | Instruction::Phi { dest, ..} => Some(dest),
             Instruction::Retain { .. } | Instruction::Release { .. } => None,
         }
     }
@@ -73,6 +80,7 @@ impl Instruction {
             | Instruction::PrimOp { dest , ..} 
             | Instruction::DirectCall { dest, ..} 
             | Instruction::Call { dest, ..} 
+            | Instruction::MakeClosure { dest, ..}
             | Instruction::MakeVector { dest, .. } 
             | Instruction::MakeList { dest, ..} 
             | Instruction::Phi { dest, ..} => Some(dest),
@@ -87,7 +95,12 @@ impl Instruction {
             Instruction::Const { .. } => vec![],
             Instruction::PrimOp { args, .. } => args.clone(),
             Instruction::DirectCall { args, .. } => args.clone(),
-            Instruction::Call {  args, .. } => args.clone(),
+            Instruction::Call { func, args, .. } => {
+                let mut uses = args.clone();
+                uses.push(*func);
+                uses
+            } ,
+            Instruction::MakeClosure { captures, ..} => captures.clone(),
             Instruction::MakeVector { elements, .. } => elements.clone(),
             Instruction::MakeList { elements, .. } => elements.clone(),
             Instruction::Retain { value } => vec![*value],
@@ -143,6 +156,16 @@ pub struct BasicBlock {
     pub predecessors: Vec<BlockId>
 }
 
+impl BasicBlock {
+    pub fn emit(&mut self, i: Instruction) {
+        self.instructions.push(i);
+    }
+
+    pub fn terminate(&mut self, t: Terminator) {
+        self.terminator = t;
+    }
+}
+
 /// Function in IR 
 #[derive(Debug, Clone)]
 pub struct Function {
@@ -188,14 +211,67 @@ impl Function {
 pub struct Namespace {
     pub functions: HashMap<FunctionId, Function>,
     pub next_function_id: u32,
+    pub global_env: HashMap<SymbolId, TypedValue>,
+    pub symbols: HashMap<String, SymbolId>,
+    next_symbol_id: u32,
+
+    // Runtime function IDs (registered during initialization)
+    pub runtime_get_var: FunctionId,
+    pub runtime_set_var: FunctionId,
 }
 
 impl Namespace {
     pub fn new() -> Self {
-        Self {
+        let mut ns = Self {
             functions: HashMap::new(),
-            next_function_id: 0
-        }
+            global_env: HashMap::new(),
+            symbols: HashMap::new(),
+            next_function_id: 0,
+            next_symbol_id: 0,
+            runtime_get_var: FunctionId(0),  // Placeholder
+            runtime_set_var: FunctionId(0),  // Placeholder
+        };
+
+        // Register runtime functions
+        ns.runtime_get_var = ns.register_runtime_function(
+            "runtime_get_var",
+            vec![Type::String],      // Takes symbol name
+            Type::BoxedLispVal       // Returns boxed value
+        );
+
+        ns.runtime_set_var = ns.register_runtime_function(
+            "runtime_set_var",
+            vec![Type::String, Type::BoxedLispVal],  // Takes name + value
+            Type::BoxedLispVal       // Returns the value set
+        );
+
+        // Now next_function_id is 2, first user function gets ID 2
+        ns
+    }
+
+    /// Register a runtime function stub (has signature but no implementation blocks)
+    fn register_runtime_function(&mut self, name: &str, params: Vec<Type>, return_type: Type) -> FunctionId {
+        let func_id = FunctionId(self.next_function_id);
+        self.next_function_id += 1;
+
+        // Create parameter TypedValues
+        let typed_params: Vec<TypedValue> = params.into_iter()
+            .enumerate()
+            .map(|(i, ty)| TypedValue { id: SsaId(i as u32), ty })
+            .collect();
+
+        // Create a stub function (no actual blocks, just signature)
+        let func = Function {
+            id: func_id,
+            name: name.to_string(),
+            params: typed_params,
+            return_type,
+            blocks: vec![],  // Empty - this is a runtime stub
+            entry_block: BlockId(0),
+        };
+
+        self.functions.insert(func_id, func);
+        func_id
     }
 
     pub fn add_function(&mut self, f: Function) -> FunctionId {
@@ -203,6 +279,39 @@ impl Namespace {
         self.functions.insert(id, f);
         id
     }
+
+    pub fn intern_symbol(&mut self, var_id: &str) -> SymbolId {
+        if let Some(&id) = self.symbols.get(var_id) {
+            return id;
+        }
+        let id = SymbolId(self.next_symbol_id);
+        self.next_symbol_id += 1;
+        self.symbols.insert(var_id.to_string(), id);
+        id
+    }
+
+    /// Look up an existing symbol ID (doesn't intern)
+    pub fn get_symbol_id(&self, name: &str) -> Option<SymbolId> {
+        self.symbols.get(name).copied()
+    }
+    
+    /// Add a global variable definition
+    pub fn add_def(&mut self, sym_id: SymbolId, val_type: TypedValue) {
+        self.global_env.insert(sym_id, val_type);
+    }
+
+    /// Look up a global variable's type info
+    pub fn lookup_global(&self, sym_id: SymbolId) -> Option<&TypedValue> {
+        self.global_env.get(&sym_id)
+    }
+
+    /// Reverse lookup: SymbolId → String (useful for debugging)
+    pub fn get_symbol_name(&self, id: SymbolId) -> Option<&str> {
+        self.symbols.iter()
+            .find(|(_, sym_id)| *sym_id == &id)
+            .map(|(name, _)| name.as_str())
+    }
+
 }
 
 
