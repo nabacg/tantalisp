@@ -169,6 +169,66 @@ impl Type {
 
         }
     }
+
+
+      /// Meet operation - find the most specific type satisfying both constraints
+      /// Used for constraint-based type narrowing (i.e. more like intersection of types, than union like .join)
+      pub fn meet(&self, other: &Type) -> Type {
+        use Type::*;
+
+        // If either is Bottom, result is Bottom (inconsistent)
+        if matches!(self, Bottom) || matches!(other, Bottom) {
+            return Bottom;
+        }
+
+        // If either is Any, use the other (narrow down)
+        match (self, other) {
+            (Any, ty) | (ty, Any) => ty.clone(),  // Intersection not Union of types like for .join
+
+            // Same concrete type - consistent
+            (ty1, ty2) if ty1 == ty2 => ty1.clone(),
+
+            // Function types - contravariant params, covariant return
+            (Function { params: p1, return_type: r1 },
+             Function { params: p2, return_type: r2 }) => {
+                if p1.len() != p2.len() {
+                    return Bottom;
+                }
+                let params: Vec<_> = p1.iter()
+                    .zip(p2)
+                    .map(|(t1, t2)| t1.meet(t2))  // Meet parameters
+                    .collect();
+
+                if params.iter().any(|t| matches!(t, Bottom)) {
+                    return Bottom;
+                }
+
+                Function {
+                    params,
+                    return_type: Box::new(r1.meet(r2))
+                }
+            }
+
+            // Union types - intersection
+            (Union(types1), Union(types2)) => {
+                let intersection: Vec<_> = types1.iter()
+                    .filter(|t1| types2.iter().any(|t2| *t1 == t2))
+                    .cloned()
+                    .collect();
+
+                if intersection.is_empty() {
+                    Bottom
+                } else if intersection.len() == 1 {
+                    intersection[0].clone()
+                } else {
+                    Union(intersection)
+                }
+            }
+
+            // Different concrete types - inconsistent!
+            _ => Bottom,
+        }
+    }
 }
 
 impl fmt::Display for Type {
