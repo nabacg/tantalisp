@@ -1,8 +1,8 @@
-mod lexer;
-mod parser;
+pub mod lexer;
+pub mod parser;
 mod evaluator;
 mod codegen;
-mod ir;
+pub mod ir;
 
 
 use anyhow::{anyhow, Result};
@@ -23,29 +23,32 @@ pub use codegen::{set_gc_debug_mode, start_gc_monitor};
 pub struct Tantalisp<'l> {
     debug_mode: bool,
     interpreted_mode: bool,
+    print_ir: bool,
     interpreter_env: Option<Environment<'l>>,
     codegen: Option<CodeGen<'l>>
 }
 
 impl<'l> Tantalisp<'l> {
-    pub fn new(debug_mode: bool, interpreted_mode: bool) -> Self {
+    pub fn new(debug_mode: bool, interpreted_mode: bool, print_ir: bool) -> Self {
         if interpreted_mode {
 
-            Self { 
-                debug_mode, 
+            Self {
+                debug_mode,
                 interpreted_mode,
-                interpreter_env: Some(Environment::global()), 
+                print_ir,
+                interpreter_env: Some(Environment::global()),
                 codegen: None,
             }
         } else {
             // allocate Ctx and don't store it, it will outlive codegen
-            // TODO - find a more correct solution, but it's late 
+            // TODO - find a more correct solution, but it's late
             let ctx = Box::leak(Box::new(Context::create()));
 
-            Self { 
-                debug_mode, 
+            Self {
+                debug_mode,
                 interpreted_mode,
-                interpreter_env: None, 
+                print_ir,
+                interpreter_env: None,
                 codegen: Some(CodeGen::new(ctx, debug_mode))
             }
         }
@@ -132,6 +135,20 @@ impl<'l> Tantalisp<'l> {
         let ast = parse(&tokens[..])?;
         if self.debug_mode {
             println!("AST:\n{}", ast.iter().map(|t| format!("{:?}", t)).collect::<Vec<_>>().join("\n"));
+        }
+
+        // Print IR if --print-ir flag is set (for JIT mode only)
+        if self.print_ir && !self.interpreted_mode {
+            use ir::ir_builder::IrLoweringContext;
+            let ctx = IrLoweringContext::new();
+            match ctx.lower_program(&ast) {
+                Ok(namespace) => {
+                    println!("\nIR:\n{}", namespace);
+                }
+                Err(e) => {
+                    eprintln!("IR lowering error: {}", e);
+                }
+            }
         }
 
         if self.interpreted_mode {

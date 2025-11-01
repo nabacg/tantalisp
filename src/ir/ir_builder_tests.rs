@@ -1013,4 +1013,55 @@ mod ir_lowering_tests {
         assert_eq!(set_var.params[1].ty, Type::BoxedLispVal, "Second param should be BoxedLispVal");
         assert_eq!(set_var.return_type, Type::BoxedLispVal, "Should return BoxedLispVal");
     }
+
+    #[test]
+    fn test_pretty_print_ir() {
+        // This test demonstrates the LLVM-style pretty printing
+        let expr = SExpr::DefExpr(
+            "factorial".to_string(),
+            Box::new(SExpr::LambdaExpr(
+                vec![SExpr::Symbol("n".to_string())],
+                vec![
+                    SExpr::IfExpr(
+                        Box::new(SExpr::List(vec![
+                            SExpr::Symbol("<=".to_string()),
+                            SExpr::Symbol("n".to_string()),
+                            SExpr::Int(1),
+                        ])),
+                        vec![SExpr::Int(1)],
+                        vec![SExpr::List(vec![
+                            SExpr::Symbol("*".to_string()),
+                            SExpr::Symbol("n".to_string()),
+                            SExpr::List(vec![
+                                SExpr::Symbol("factorial".to_string()),
+                                SExpr::List(vec![
+                                    SExpr::Symbol("-".to_string()),
+                                    SExpr::Symbol("n".to_string()),
+                                    SExpr::Int(1),
+                                ]),
+                            ]),
+                        ])],
+                    ),
+                ],
+            )),
+        );
+
+        let ns = lower_expr_to_namespace(&expr).unwrap();
+
+        // Print to stdout for manual inspection (only when running with --nocapture)
+        println!("\n====== Pretty Printed IR ======");
+        println!("{}", ns);
+        println!("==============================\n");
+
+        // Basic validation
+        assert!(ns.functions.len() >= 2); // At least toplevel + factorial
+
+        // Find the factorial function
+        let factorial_fn = ns.functions.values()
+            .find(|f| f.params.len() == 1 && f.blocks.len() > 1)
+            .expect("Should have factorial function");
+
+        // Should have multiple basic blocks (if-then-else structure)
+        assert!(factorial_fn.blocks.len() >= 3);
+    }
 }

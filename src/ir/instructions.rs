@@ -314,6 +314,185 @@ impl Namespace {
 
 }
 
+// ============================================================================
+// Pretty Printing (LLVM-style IR formatting)
+// ============================================================================
+
+use std::fmt;
+
+impl fmt::Display for Instruction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Instruction::Const { dest, value } => {
+                write!(f, "  {}: {} = const ", dest.id, dest.ty)?;
+                match value {
+                    Constant::Int(i) => write!(f, "{}", i),
+                    Constant::Bool(b) => write!(f, "{}", b),
+                    Constant::String(s) => write!(f, "\"{}\"", s.escape_debug()),
+                    Constant::Unit => write!(f, "unit"),
+                    Constant::Nil => write!(f, "nil"),
+                }
+            }
+            Instruction::PrimOp { dest, op, args } => {
+                write!(f, "  {}: {} = {:?}(", dest.id, dest.ty, op)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ")")
+            }
+            Instruction::DirectCall { dest, func, args } => {
+                write!(f, "  {}: {} = call @f{}(", dest.id, dest.ty, func.0)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ")")
+            }
+            Instruction::Call { dest, func, args } => {
+                write!(f, "  {}: {} = call {}(", dest.id, dest.ty, func)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ")")
+            }
+            Instruction::MakeClosure { dest, func, captures } => {
+                write!(f, "  {}: {} = makeclosure @f{}[", dest.id, dest.ty, func.0)?;
+                for (i, cap) in captures.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", cap)?;
+                }
+                write!(f, "]")
+            }
+            Instruction::MakeVector { dest, elements } => {
+                write!(f, "  {}: {} = makevector [", dest.id, dest.ty)?;
+                for (i, elem) in elements.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", elem)?;
+                }
+                write!(f, "]")
+            }
+            Instruction::MakeList { dest, elements } => {
+                write!(f, "  {}: {} = makelist (", dest.id, dest.ty)?;
+                for (i, elem) in elements.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", elem)?;
+                }
+                write!(f, ")")
+            }
+            Instruction::Retain { value } => {
+                write!(f, "  retain {}", value)
+            }
+            Instruction::Release { value } => {
+                write!(f, "  release {}", value)
+            }
+            Instruction::Phi { dest, incoming } => {
+                write!(f, "  {}: {} = phi [", dest.id, dest.ty)?;
+                for (i, (val, block)) in incoming.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "({}, {})", val, block)?;
+                }
+                write!(f, "]")
+            }
+        }
+    }
+}
+
+impl fmt::Display for Terminator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Terminator::Return { value } => {
+                write!(f, "  return {}", value)
+            }
+            Terminator::Jump { target } => {
+                write!(f, "  jump {}", target)
+            }
+            Terminator::Branch { condition, truthy_block, falsy_block } => {
+                write!(f, "  branch {}, {}, {}", condition, truthy_block, falsy_block)
+            }
+            Terminator::Unreachable => {
+                write!(f, "  unreachable")
+            }
+        }
+    }
+}
+
+impl fmt::Display for BasicBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}:", self.id)?;
+        for instr in &self.instructions {
+            writeln!(f, "{}", instr)?;
+        }
+        writeln!(f, "{}", self.terminator)
+    }
+}
+
+impl fmt::Display for Function {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Function signature
+        write!(f, "function @f{}(", self.id.0)?;
+        for (i, param) in self.params.iter().enumerate() {
+            if i > 0 { write!(f, ", ")?; }
+            write!(f, "{}: {}", param.id, param.ty)?;
+        }
+        writeln!(f, ") -> {} {{", self.return_type)?;
+
+        // Body
+        if self.blocks.is_empty() {
+            writeln!(f, "  ; runtime stub")?;
+        } else {
+            for block in &self.blocks {
+                write!(f, "{}", block)?;
+            }
+        }
+
+        writeln!(f, "}}")
+    }
+}
+
+impl fmt::Display for Namespace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "; Namespace IR")?;
+        writeln!(f, "; {} functions, {} symbols, {} globals\n",
+            self.functions.len(),
+            self.symbols.len(),
+            self.global_env.len())?;
+
+        // Print symbol table
+        if !self.symbols.is_empty() {
+            writeln!(f, "; Symbol Table:")?;
+            let mut syms: Vec<_> = self.symbols.iter().collect();
+            syms.sort_by_key(|(_, id)| id.0);
+            for (name, id) in syms {
+                writeln!(f, ";   {} = SymbolId({})", name, id.0)?;
+            }
+            writeln!(f)?;
+        }
+
+        // Print global environment
+        if !self.global_env.is_empty() {
+            writeln!(f, "; Global Environment:")?;
+            for (sym_id, typed_val) in &self.global_env {
+                let name = self.get_symbol_name(*sym_id).unwrap_or("?");
+                writeln!(f, ";   {} = {}: {}", name, typed_val.id, typed_val.ty)?;
+            }
+            writeln!(f)?;
+        }
+
+        // Print functions in order
+        let mut func_ids: Vec<_> = self.functions.keys().copied().collect();
+        func_ids.sort_by_key(|id| id.0);
+
+        for func_id in func_ids {
+            let func = &self.functions[&func_id];
+            writeln!(f, "{}", func)?;
+        }
+
+        Ok(())
+    }
+}
+
 
 #[cfg(test)]
 mod instructions_tests {

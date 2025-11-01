@@ -12,9 +12,10 @@ struct Args {
     debug: bool,
 
     #[arg(short, long, default_value_t = false)]
-    interpreter: bool
+    interpreter: bool,
 
-
+    #[arg(long, default_value_t = false)]
+    print_ir: bool,
 }
 
 fn main() -> Result<()> {
@@ -30,7 +31,7 @@ fn main() -> Result<()> {
     // let args: Vec<String> = env::args().collect();
     let args = Args::parse();
 
-    let mut lisp = Tantalisp::new(args.debug, args.interpreter);
+    let mut lisp = Tantalisp::new(args.debug, args.interpreter, args.print_ir);
  
     match args.file {
         Some(file) => {

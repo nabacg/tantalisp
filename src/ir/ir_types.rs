@@ -1,12 +1,12 @@
-use std::{cmp::Ordering, fmt::Display};
+use std::{cmp::Ordering, fmt};
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SsaId(pub u32);
 
-impl Display for SsaId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // let's do LLVM IR stype %1, %2 for now
+impl fmt::Display for SsaId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // let's do LLVM IR style %1, %2 for now
         write!(f, "%{}", self.0)
     }
 }
@@ -15,8 +15,8 @@ impl Display for SsaId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockId(pub u32);
 
-impl Display for BlockId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for BlockId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "bb{}", self.0)
     }
 }
@@ -30,7 +30,7 @@ pub struct FunctionId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SymbolId(pub u32);
 
-// type system 
+// Type system
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
 pub enum Type {
     /// Int (i32)
@@ -171,6 +171,36 @@ impl Type {
     }
 }
 
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Type::Int => write!(f, "Int"),
+            Type::Bool => write!(f, "Bool"),
+            Type::String => write!(f, "String"),
+            Type::List => write!(f, "List"),
+            Type::Vector => write!(f, "Vector"),
+            Type::BoxedLispVal => write!(f, "BoxedLispVal"),
+            Type::Function { params, return_type } => {
+                write!(f, "(")?;
+                for (i, param) in params.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", param)?;
+                }
+                write!(f, ") -> {}", return_type)
+            }
+            Type::Any => write!(f, "Any"),
+            Type::Union(types) => {
+                write!(f, "(")?;
+                for (i, ty) in types.iter().enumerate() {
+                    if i > 0 { write!(f, " | ")?; }
+                    write!(f, "{}", ty)?;
+                }
+                write!(f, ")")
+            }
+            Type::Bottom => write!(f, "Bottom"),
+        }
+    }
+}
 
 impl Ord for Type {
     fn cmp(&self, other: &Self) -> Ordering {
