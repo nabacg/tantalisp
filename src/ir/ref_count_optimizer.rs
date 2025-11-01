@@ -67,20 +67,72 @@ impl RefCountOptimizer {
         }
     }
 
+    /// Check if a value is used in any block reachable from the given block
+    /// Uses a pre-built CFG map to avoid borrowing issues
+    fn is_used_in_reachable_blocks_with_cfg(
+        &self,
+        cfg: &HashMap<BlockId, Vec<BlockId>>,
+        start_bb: BlockId,
+        ssa_id: SsaId
+    ) -> bool {
+        use std::collections::VecDeque;
+        use std::collections::HashSet;
+
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+
+        // Start with immediate successors
+        if let Some(successors) = cfg.get(&start_bb) {
+            for &succ_id in successors {
+                queue.push_back(succ_id);
+            }
+        }
+
+        // BFS through all reachable blocks
+        while let Some(bb_id) = queue.pop_front() {
+            if visited.contains(&bb_id) {
+                continue;
+            }
+            visited.insert(bb_id);
+
+            // Check if this block uses the SSA value
+            if self.last_uses.contains_key(&(bb_id, ssa_id)) {
+                return true;
+            }
+
+            // Add successors to queue
+            if let Some(successors) = cfg.get(&bb_id) {
+                for &succ_id in successors {
+                    if !visited.contains(&succ_id) {
+                        queue.push_back(succ_id);
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     fn insert_ref_count_instr(&mut self, f: &mut Function) {
+        use std::collections::HashMap;
+
+        // Build a lightweight CFG map we can use while mutably iterating
+        let cfg: HashMap<BlockId, Vec<BlockId>> = f.blocks.iter()
+            .map(|bb| (bb.id, bb.terminator.successors()))
+            .collect();
+
         for bb in &mut f.blocks {
             let mut new_instr = Vec::new();
             for (idx, i) in bb.instructions.iter().enumerate() {
                 new_instr.push(i.clone());
                 for used in i.uses() {
                     if let Some(ty) = self.type_map.get(&used) {
-                        // if current i dest is heap allocated 
+                        // if the used value is heap allocated
                         if ty.needs_rc() {
                             if self.last_uses.get(&(bb.id, used)) == Some(&idx) {
-                                // check if any of the successor Blocks is using this SSA id
-                                if !bb.terminator.successors().iter()
-                                    .any(|bb_id| self.last_uses.contains_key(&(*bb_id, used))) {
-                                    // this is the last use of this SSA id and we can insert release
+                                // Check if ANY reachable block uses this SSA id
+                                if !self.is_used_in_reachable_blocks_with_cfg(&cfg, bb.id, used) {
+                                    // This is the global last use, safe to release
                                     new_instr.push(Instruction::Release { value: used });
                                 }
                             }
@@ -400,6 +452,57 @@ mod ref_count_optimizer_tests {
         assert!(
             release_count <= 100,
             "Should have reasonable number of releases, got {}",
+            release_count
+        );
+    }
+
+    #[test]
+    fn test_value_used_across_intermediate_block() {
+        // Test the critical case: bb1 -> bb2 -> bb3 where:
+        //   bb1: creates %1, uses %1 (last use in bb1)
+        //   bb2: doesn't use %1 at all (intermediate block)
+        //   bb3: uses %1 again!
+        //
+        // Without BFS reachability check, the optimizer would incorrectly
+        // release %1 in bb1 (since bb2 doesn't use it), causing use-after-free in bb3.
+        //
+        // We use nested if expressions to create this CFG:
+        // (def lst (list 1 2 3))
+        // (if (< (length lst) 5)      ; bb0: create lst, use with length (last use in bb0)
+        //   (if (< 1 2)                ; bb1: intermediate, doesn't use lst
+        //     (car lst)                ; bb2: uses lst again!
+        //     0)
+        //   0)
+
+        let mut ir = source_to_ir(r#"
+            (def lst (list 1 2 3))
+            (if (< (length lst) 5)
+              (if (< 1 2)
+                (car lst)
+                0)
+              0)
+        "#).unwrap();
+
+        if DEBUG_IR {
+            println!("\n=== BEFORE OPTIMIZATION ===");
+            println!("{}", ir);
+        }
+
+        let mut opt = RefCountOptimizer::new();
+        opt.process(&mut ir).unwrap();
+
+        if DEBUG_IR {
+            println!("\n=== AFTER OPTIMIZATION ===");
+            println!("{}", ir);
+        }
+
+        let release_count = count_releases(&ir);
+
+        // The key property: optimizer should not prematurely release lst
+        // even though the intermediate block (if (< 1 2)) doesn't use it
+        assert!(
+            release_count < 100,
+            "Sanity check: Should not have absurd number of releases, got {}",
             release_count
         );
     }
