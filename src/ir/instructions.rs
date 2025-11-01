@@ -218,6 +218,8 @@ pub struct Namespace {
     // Runtime function IDs (registered during initialization)
     pub runtime_get_var: FunctionId,
     pub runtime_set_var: FunctionId,
+
+    pub entry_point_function_id: Option<FunctionId>,
 }
 
 impl Namespace {
@@ -230,6 +232,7 @@ impl Namespace {
             next_symbol_id: 0,
             runtime_get_var: FunctionId(0),  // Placeholder
             runtime_set_var: FunctionId(0),  // Placeholder
+            entry_point_function_id: None
         };
 
         // Register runtime functions
@@ -278,6 +281,10 @@ impl Namespace {
         let id = f.id;
         self.functions.insert(id, f);
         id
+    }
+
+    pub fn set_entry_point(&mut self, id:FunctionId) {
+        self.entry_point_function_id = Some(id);
     }
 
     pub fn intern_symbol(&mut self, var_id: &str) -> SymbolId {

@@ -154,7 +154,9 @@ impl IrLoweringContext {
 
         // finish the function and it to namespace
         let func = self.builder.finish(toplevel_id, "<toplevel>".to_string(), vec![], Type::Any);
+        let func_id = func.id;
         self.namespace.add_function(func);
+        self.namespace.set_entry_point(func_id);
         Ok(self.namespace)
 
     }
@@ -333,7 +335,7 @@ impl IrLoweringContext {
                     for e in t_exprs { visit(e, bound, free); }
                     for e in f_exprs { visit(e, bound, free); }
                 }
-                SExpr::DefExpr(name, val) => {
+                SExpr::DefExpr(_, val) => {
                     visit(val, bound, free);
                     // 'def' binds in the current scope, so don't mark as free
                 }

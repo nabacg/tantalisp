@@ -295,7 +295,7 @@ impl Operator {
                         if arg_types.iter().all(|t| matches!(t, Type::Int)) {
                             Type::Int
                         } else {
-                            Type::Any
+                            Type::Int
                         }
                     },
             Lt | Gt | Eq | Le | Ge | Ne => Type::Bool,
