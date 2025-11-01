@@ -9,6 +9,11 @@ use super::{
     ir_types::{BlockId, FunctionId, Operator, Type, TypedValue},
 };
 
+pub fn lower_to_ir(ast: &[SExpr]) -> Result<Namespace> {
+    let ctx = IrLoweringContext::new();
+    ctx.lower_program(&ast)
+}
+
 pub struct FunctionIrBuilder {
     next_ssa_id: u32,
     next_block_id: u32,
