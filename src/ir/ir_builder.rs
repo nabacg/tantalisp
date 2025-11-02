@@ -103,7 +103,7 @@ pub struct IrLoweringContext {
     env: HashMap<String, SsaId>,
     current_function_id: FunctionId,
     pub namespace: Namespace,
-    current_params: Vec<TypedValue>,
+    current_params: Vec<TypedValue>
 }
 
 macro_rules! emit_collection {
@@ -116,6 +116,10 @@ macro_rules! emit_collection {
             Ok(dest_id)
         
     }};
+}
+
+fn needs_boxing(ty: &Type) -> bool {
+    matches!(ty, Type::Int | Type::Bool)
 }
 
 
@@ -151,20 +155,38 @@ impl IrLoweringContext {
         }
 
         // return last value or Nil
-        let return_val = last_val.unwrap_or_else(|| {
+        let mut return_val = last_val.unwrap_or_else(|| {
             self.emit_constant(Type::List, Constant::Nil).unwrap()
         });
+        let return_type = self.get_ssa_type(return_val)?;
+        if needs_boxing(&return_type) {
+            return_val = self.emit_box(return_val)?;
+        }
+
         let bb = self.current_block()?;
+        
         bb.terminate(Terminator::Return { value: return_val });
 
         // finish the function and it to namespace
+<<<<<<< HEAD
         let func = self.builder.finish(toplevel_id, "<toplevel>".to_string(), vec![], Type::Any);
         let func_id = func.id;
         self.namespace.add_function(func);
         self.namespace.set_entry_point(func_id);
+=======
+        let func = self.builder.finish(toplevel_id,
+                 "<toplevel>".to_string(), 
+            vec![],
+             Type::BoxedLispVal); // <toplevel> is required to retun BoxedLispVal
+        self.namespace.add_function(func);
+        self.namespace.set_entry_fn(toplevel_id);
+        
+>>>>>>> c345a8c (codegen_v2 using our lowered SSA based IR! currently can do simple integer math only, but it does it without constant boxing / unboxing like before! WIP but it's a milestone!)
         Ok(self.namespace)
 
     }
+
+
 
     pub fn lower_expr(&mut self, expr: &SExpr) -> Result<SsaId> {
         match expr {
@@ -376,18 +398,26 @@ impl IrLoweringContext {
          }).collect::<Result<_>>()?;
          self.current_params = typed_params.clone();
 
-         let result = self.lower_block(body)?;
+         let mut result = self.lower_block(body)?;
+
+         // Box the return value if needed (same as lower_program)
+         let result_type = self.get_ssa_type(result)?;
+         if needs_boxing(&result_type) {
+             result = self.emit_box(result)?;
+         }
+
          let bb  = self.current_block()?;
          bb.terminate(Terminator::Return { value: result });
 
 
-         // swap builder and env back 
+         // swap builder and env back
          let lambda_builder = std::mem::replace(&mut self.builder, old_builder);
          self.env = old_env;
          self.current_params = old_params;
 
          // now lambda_builder can be consumed (with it's blocks etc.) to finish function definition
-         let func = lambda_builder.finish(fun_id, "unknown".to_string(), typed_params, Type::Any);
+         // All lambdas return BoxedLispVal for uniform calling convention
+         let func = lambda_builder.finish(fun_id, "unknown".to_string(), typed_params, Type::BoxedLispVal);
          self.namespace.add_function(func);
 
          let param_names: HashSet<String> = params.iter().filter_map(|p| match p {
@@ -486,7 +516,23 @@ impl IrLoweringContext {
         Ok(Type::Any)
     }
     
+    fn emit_box(&mut self, value: SsaId) -> Result<SsaId> {
+        let dest = self.builder.fresh_ssa(Type::BoxedLispVal);
+        let dest_id = dest.id;
+        let bb = self.current_block()?;
+        bb.emit(Instruction::Box{dest, value});
+        Ok(dest_id)
+    }
+    
 
+    fn emit_unbox(&mut self, value: SsaId, expected_type: Type) -> Result<SsaId> {
+        let dest = self.builder.fresh_ssa(Type::BoxedLispVal);
+        let dest_id = dest.id;
+        let bb = self.current_block()?;
+        bb.emit(Instruction::Unbox {dest, value, expected_type});
+        Ok(dest_id)
+    }
+    
 }
 
 

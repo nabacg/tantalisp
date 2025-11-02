@@ -1,24 +1,25 @@
 pub mod lexer;
 pub mod parser;
 mod evaluator;
-mod codegen;
+// mod codegen;
 pub mod ir;
-
+pub mod v2_codegen;
 
 use anyhow::{anyhow, Result};
 use inkwell::context::Context;
+use ir::ir_builder::lower_to_ir;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use lexer::tokenize;
 use parser::parse;
 use evaluator::{eval, eval_with_env};
-use codegen::CodeGen;
+use v2_codegen::CodeGen;
 
 // Re-export Environment for REPL
 pub use evaluator::Environment;
 
 // Re-export GC debug functions
-pub use codegen::{set_gc_debug_mode, start_gc_monitor};
+pub use v2_codegen::{set_gc_debug_mode, start_gc_monitor};
 
 pub struct Tantalisp<'l> {
     debug_mode: bool,
@@ -62,7 +63,7 @@ impl<'l> Tantalisp<'l> {
         println!("Mode: {} | Debug: {}", mode, debug);
 
         // Load prelude (standard library)
-        self.load_prelude()?;
+        //self.load_prelude()?;
 
         println!("Type expressions to evaluate.");
         println!("Exit: Ctrl+C, Ctrl+D, or type :quit");
@@ -126,7 +127,7 @@ impl<'l> Tantalisp<'l> {
 
     pub fn rep(&mut self, input: &str) -> Result<()> {
         // Load prelude first (if not already loaded)
-        self.load_prelude()?;
+        // self.load_prelude()?;
 
         let tokens = tokenize(input)?;
         if self.debug_mode {
@@ -156,8 +157,9 @@ impl<'l> Tantalisp<'l> {
             println!("Result:\n{}", result);
         } else {
             let codegen = self.codegen.as_mut().ok_or(anyhow!("compiled_mode but empty codegen"))?;
+            let ir = lower_to_ir(&ast)?;
 
-            let result = codegen.compile_and_run(&ast)?;
+            let result = codegen.compile_and_run(ir)?;
             println!("Result:\n{}", result);
 
         }
@@ -178,7 +180,9 @@ impl<'l> Tantalisp<'l> {
         } else {
             let codegen = self.codegen.as_mut().ok_or(anyhow!("compiled_mode but empty codegen"))?;
 
-            let result = codegen.repl_compile(&ast)?;
+            let ir = lower_to_ir(&ast)?;
+
+            let result = codegen.repl_compile(ir)?;
             println!("{}", result);
         }
 
@@ -211,9 +215,9 @@ impl<'l> Tantalisp<'l> {
                 } else {
                     let codegen = self.codegen.as_mut()
                         .ok_or(anyhow!("compiled_mode but empty codegen"))?;
-                    for expr in ast {
-                        let _ = codegen.repl_compile(&[expr])?;
-                    }
+                    let ir = lower_to_ir(&ast)?;
+
+                    let _ = codegen.repl_compile(ir)?;
                 }
 
                 println!("Loaded standard library from {}", prelude_path);

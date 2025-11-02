@@ -56,6 +56,16 @@ pub enum Instruction {
     Phi {
         dest: TypedValue,
         incoming: Vec<(SsaId, BlockId)>
+    },
+    // Boxing simple vals into BoxedLispVal
+    Box {
+        dest: TypedValue, // Type should always be BoxedLispVal
+        value: SsaId      // value being boxed
+    },
+    Unbox {
+        dest: TypedValue,
+        value: SsaId, 
+        expected_type: Type 
     }
 }
 
@@ -69,7 +79,9 @@ impl Instruction {
                     | Instruction::MakeClosure { dest, ..}
                     | Instruction::MakeVector { dest, .. } 
                     | Instruction::MakeList { dest, ..} 
-                    | Instruction::Phi { dest, ..} => Some(dest),
+                    | Instruction::Phi { dest, ..} 
+                    | Instruction::Box { dest,.. } 
+                    | Instruction::Unbox { dest,.. }=> Some(dest),
             Instruction::Retain { .. } | Instruction::Release { .. } => None,
         }
     }
@@ -83,7 +95,9 @@ impl Instruction {
             | Instruction::MakeClosure { dest, ..}
             | Instruction::MakeVector { dest, .. } 
             | Instruction::MakeList { dest, ..} 
-            | Instruction::Phi { dest, ..} => Some(dest),
+            | Instruction::Phi { dest, ..} 
+            | Instruction::Box { dest,.. } 
+            | Instruction::Unbox { dest,.. }=> Some(dest),
             Instruction::Retain { .. } | Instruction::Release { .. } => None,
         }
     }
@@ -96,19 +110,21 @@ impl Instruction {
             Instruction::PrimOp { args, .. } => args.clone(),
             Instruction::DirectCall { args, .. } => args.clone(),
             Instruction::Call { func, args, .. } => {
-                let mut uses = args.clone();
-                uses.push(*func);
-                uses
-            } ,
+                        let mut uses = args.clone();
+                        uses.push(*func);
+                        uses
+                    } ,
             Instruction::MakeClosure { captures, ..} => captures.clone(),
             Instruction::MakeVector { elements, .. } => elements.clone(),
             Instruction::MakeList { elements, .. } => elements.clone(),
             Instruction::Retain { value } => vec![*value],
             Instruction::Release { value } => vec![*value],
             Instruction::Phi { incoming, .. } => incoming
-                                                                            .iter()
-                                                                            .map(|(val, _)| *val)
-                                                                            .collect(),
+                                                                                    .iter()
+                                                                                    .map(|(val, _)| *val)
+                                                                                    .collect(),
+            Instruction::Box { value, .. } => vec![*value],
+            Instruction::Unbox { value, ..} => vec![*value],
         }
     }
 }
@@ -218,8 +234,12 @@ pub struct Namespace {
     // Runtime function IDs (registered during initialization)
     pub runtime_get_var: FunctionId,
     pub runtime_set_var: FunctionId,
+<<<<<<< HEAD
 
     pub entry_point_function_id: Option<FunctionId>,
+=======
+    pub entry_fn_id: Option<FunctionId>,
+>>>>>>> c345a8c (codegen_v2 using our lowered SSA based IR! currently can do simple integer math only, but it does it without constant boxing / unboxing like before! WIP but it's a milestone!)
 }
 
 impl Namespace {
@@ -232,7 +252,11 @@ impl Namespace {
             next_symbol_id: 0,
             runtime_get_var: FunctionId(0),  // Placeholder
             runtime_set_var: FunctionId(0),  // Placeholder
+<<<<<<< HEAD
             entry_point_function_id: None
+=======
+            entry_fn_id: None
+>>>>>>> c345a8c (codegen_v2 using our lowered SSA based IR! currently can do simple integer math only, but it does it without constant boxing / unboxing like before! WIP but it's a milestone!)
         };
 
         // Register runtime functions
@@ -318,6 +342,15 @@ impl Namespace {
             .find(|(_, sym_id)| *sym_id == &id)
             .map(|(name, _)| name.as_str())
     }
+    
+    pub(crate) fn set_entry_fn(&mut self, fn_id: FunctionId)  {
+        self.entry_fn_id = Some(fn_id);
+    }
+
+    pub(crate) fn get_entry_fn(&self) -> Option<&Function> {
+        self.entry_fn_id.map(|id| self.functions.get(&id)).flatten()
+    }
+
 
 }
 
@@ -401,6 +434,12 @@ impl fmt::Display for Instruction {
                     write!(f, "({}, {})", val, block)?;
                 }
                 write!(f, "]")
+            }
+            Instruction::Box { dest, value } => {
+                write!(f, "  {}: {} = box {}", dest.id, dest.ty, value)
+            }
+            Instruction::Unbox { dest, value, expected_type } => {
+                write!(f, "  {}: {} = unbox {} as {}", dest.id, dest.ty, value, expected_type)
             }
         }
     }

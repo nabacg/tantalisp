@@ -35,8 +35,8 @@ unsafe impl GlobalAlloc for RefCountingAllocator {
     }
 }
 
-//#[global_allocator]
-// static GC: RefCountingAllocator = RefCountingAllocator;
+#[global_allocator]
+static GC: RefCountingAllocator = RefCountingAllocator;
 
 pub fn print_memory_stats() {
     let allocated = ALLOCATED.load(Ordering::SeqCst);
