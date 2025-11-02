@@ -881,29 +881,496 @@ impl<'ctx> Drop for CodeGen<'ctx> {
 #[cfg(test)]
 mod codegen_test {
     use crate::{ir::ir_builder::lower_to_ir, lexer::tokenize, parser::parse};
-
     use super::*;
-    
+
+    const DEBUG_MODE: bool = false;
+
     fn source_to_ir(source: &str) -> Result<Namespace> {
         let tokens = tokenize(source)?;
         let ast = parse(&tokens)?;
         lower_to_ir(&ast)
     }
 
-
+    // ============================================================================
+    // Basic Scalar Tests
+    // ============================================================================
 
     #[test]
-    fn test_int_math() {
-
+    fn test_scalar_int_expr() {
         let mut ctx = Context::create();
-        let mut codegen = CodeGen::new(&mut ctx, true);
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
 
-        let ir = source_to_ir("(+ 2 2)").expect("failed to parse input");
-        let res = codegen.repl_compile(ir).expect("failed to compile");
-        assert_eq!("4", res);
+        let ir = source_to_ir("42").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "42");
+    }
 
-        let ir = source_to_ir("(+ (* 4 10) 2)").expect("failed to parse input");
-        let res = codegen.repl_compile(ir).expect("failed to compile");
-        assert_eq!("42", res);
+    #[test]
+    fn test_bool_expr() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        // Test false
+        let ir = source_to_ir(":false").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":false");
+
+        // Test true
+        let ir = source_to_ir(":true").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":true");
+    }
+
+    // ============================================================================
+    // Arithmetic Operations
+    // ============================================================================
+
+    #[test]
+    fn test_integer_math() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(+ 41 1)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "42");
+    }
+
+    #[test]
+    fn test_jit_integer_math() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        // Test 1: Simple arithmetic (+ 40 2)
+        let ir = source_to_ir("(+ 40 2)").expect("failed to parse");
+        match codegen.repl_compile(ir) {
+            Ok(result) => assert_eq!("42", result),
+            Err(e) => panic!("Error: {}", e),
+        }
+
+        // Test 2: Lambda call - ((fn [x y] (+ x y)) 41 1)
+        let ir = source_to_ir("((fn [x y] (+ x y)) 41 1)").expect("failed to parse");
+        let result = codegen.repl_compile(ir).unwrap();
+        assert_eq!("42", result);
+    }
+
+    #[test]
+    fn test_nested_arithmetic() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(+ (* 4 10) 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "42");
+    }
+
+    // ============================================================================
+    // Comparison Operators
+    // ============================================================================
+
+    #[test]
+    fn test_eq_operator() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        // Test: (= 1 1) should return :true
+        let ir = source_to_ir("(= 1 1)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok(), "Failed to evaluate (= 1 1): {:?}", result.err());
+        assert_eq!(result.unwrap(), ":true");
+
+        // Test: (= 1 2) should return :false
+        let ir = source_to_ir("(= 1 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok(), "Failed to evaluate (= 1 2): {:?}", result.err());
+        assert_eq!(result.unwrap(), ":false");
+    }
+
+    #[test]
+    fn test_ne_operator() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        // Test: (!= 1 2) should return :true
+        let ir = source_to_ir("(!= 1 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":true");
+
+        // Test: (!= 1 1) should return :false
+        let ir = source_to_ir("(!= 1 1)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":false");
+    }
+
+    #[test]
+    fn test_lt_operator() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        // Test: (< 1 2) should return :true
+        let ir = source_to_ir("(< 1 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":true");
+
+        // Test: (< 2 1) should return :false
+        let ir = source_to_ir("(< 2 1)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":false");
+    }
+
+    #[test]
+    fn test_gt_operator() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        // Test: (> 2 1) should return :true
+        let ir = source_to_ir("(> 2 1)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":true");
+
+        // Test: (> 1 2) should return :false
+        let ir = source_to_ir("(> 1 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":false");
+    }
+
+    #[test]
+    fn test_le_operator() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        // Test: (<= 1 2) should return :true
+        let ir = source_to_ir("(<= 1 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":true");
+
+        // Test: (<= 1 1) should return :true
+        let ir = source_to_ir("(<= 1 1)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":true");
+
+        // Test: (<= 2 1) should return :false
+        let ir = source_to_ir("(<= 2 1)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":false");
+    }
+
+    #[test]
+    fn test_ge_operator() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        // Test: (>= 2 1) should return :true
+        let ir = source_to_ir("(>= 2 1)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":true");
+
+        // Test: (>= 1 1) should return :true
+        let ir = source_to_ir("(>= 1 1)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":true");
+
+        // Test: (>= 1 2) should return :false
+        let ir = source_to_ir("(>= 1 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ":false");
+    }
+
+    // ============================================================================
+    // If Expressions
+    // ============================================================================
+
+    #[test]
+    fn test_if_true_branch() {
+        // Test: (if (= 1 1) 42 1) should return 42
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(if (= 1 1) 42 1)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok(), "Failed to evaluate if: {:?}", result.err());
+        assert_eq!(result.unwrap(), "42");
+    }
+
+    #[test]
+    fn test_if_false_branch() {
+        // Test: (if (= 3 1) 1 42) should return 42
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(if (= 3 1) 1 42)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok(), "Failed to evaluate if: {:?}", result.err());
+        assert_eq!(result.unwrap(), "42");
+    }
+
+    // ============================================================================
+    // Global Variables (REPL persistence)
+    // ============================================================================
+
+    #[test]
+    fn test_repl_global_variables() {
+        // Test that global variables persist across REPL evaluations
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        // First REPL line: (def x 42)
+        let ir = source_to_ir("(def x 42)").expect("failed to parse");
+        let result1 = codegen.repl_compile(ir);
+        assert!(result1.is_ok(), "Failed to define x: {:?}", result1.err());
+        assert_eq!(result1.unwrap(), "42");
+
+        // Second REPL line: x (should return 42)
+        let ir = source_to_ir("x").expect("failed to parse");
+        let result2 = codegen.repl_compile(ir);
+        assert!(result2.is_ok(), "Failed to read x: {:?}", result2.err());
+        assert_eq!(result2.unwrap(), "42");
+    }
+
+    #[test]
+    fn test_repl_lambda_with_globals() {
+        // Test: (def x 40) (def f (fn [y] (* y 10))) (f (+ 2 x))
+        // Expected: 420
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(def x 40) (def f (fn [y] (* y 10))) (f (+ 2 x))")
+            .expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+        assert_eq!(result.unwrap(), "420");
+    }
+
+    // ============================================================================
+    // Lambda and Recursion
+    // ============================================================================
+
+    #[test]
+    fn test_fibonacci_recursive() {
+        // Test: (def fib (fn [x] (if (<= x 1) 1 (+ (fib (- x 1)) (fib (- x 2))))))
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        // Define fib
+        let ir = source_to_ir("(def fib (fn [x] (if (<= x 1) 1 (+ (fib (- x 1)) (fib (- x 2))))))")
+            .expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok(), "Failed to define fib: {:?}", result.err());
+
+        // Test fib(1) = 1
+        let ir = source_to_ir("(fib 1)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok(), "Failed to evaluate fib(1): {:?}", result.err());
+        assert_eq!(result.unwrap(), "1");
+
+        // Test fib(2) = 2
+        let ir = source_to_ir("(fib 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok(), "Failed to evaluate fib(2): {:?}", result.err());
+        assert_eq!(result.unwrap(), "2");
+
+        // Test fib(5) = 8
+        let ir = source_to_ir("(fib 5)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok(), "Failed to evaluate fib(5): {:?}", result.err());
+        assert_eq!(result.unwrap(), "8");
+
+        // Test fib(10) = 89
+        let ir = source_to_ir("(fib 10)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok(), "Failed to evaluate fib(10): {:?}", result.err());
+        assert_eq!(result.unwrap(), "89");
+    }
+
+    // ============================================================================
+    // Truthy/Falsy Semantics
+    // ============================================================================
+
+    #[test]
+    fn test_truthy_nil_is_falsy() {
+        // Test: (if '() 1 2) should return 2 (nil/empty list is falsy)
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(if '() 1 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "2");
+    }
+
+    #[test]
+    fn test_truthy_false_is_falsy() {
+        // Test: (if :false 1 2) should return 2 (:false is falsy)
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(if :false 1 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "2");
+    }
+
+    #[test]
+    fn test_truthy_true_is_truthy() {
+        // Test: (if :true 1 2) should return 1 (:true is truthy)
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(if :true 1 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "1");
+    }
+
+    #[test]
+    fn test_truthy_integer_is_truthy() {
+        // Test: (if 0 1 2) should return 1 (even 0 is truthy!)
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(if 0 1 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "1");
+
+        // Non-zero integer
+        let ir = source_to_ir("(if 42 1 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "1");
+    }
+
+    #[test]
+    fn test_truthy_list_is_truthy() {
+        // Test: (if (list 1 2) 42 99) should return 42
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(if (list 1 2) 42 99)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "42");
+    }
+
+    #[test]
+    fn test_truthy_lambda_is_truthy() {
+        // Test: (if (fn [x] x) 1 2) should return 1 (lambdas are truthy)
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(if (fn [x] x) 1 2)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "1");
+    }
+
+    #[test]
+    fn test_truthy_comparison_result() {
+        // Test: (if (= 1 1) 42 99) should return 42
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(if (= 1 1) 42 99)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "42");
+    }
+
+    // ============================================================================
+    // List Operations
+    // ============================================================================
+
+    #[test]
+    fn test_list_fn() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(list 1 2 3)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "(1 2 3)");
+    }
+
+    #[test]
+    fn test_nested_list_fn() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(list 1 (list 2 3) 4)").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "(1 (2 3) 4)");
+    }
+
+    #[test]
+    fn test_list_head() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(car (list 1 2 3))").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "1");
+    }
+
+    #[test]
+    fn test_list_tail() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(cdr (list 1 2 3))").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "(2 3)");
+    }
+
+    #[test]
+    fn test_list_cons() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(cons 1 (list 2 3))").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "(1 2 3)");
+    }
+
+    #[test]
+    fn test_cons_onto_nil() {
+        // Test: (cons 1 '()) should return (1), not (1 nil)
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("(cons 1 '())").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "(1)");
+    }
+
+    #[test]
+    fn test_quoted_empty_list() {
+        let mut ctx = Context::create();
+        let mut codegen = CodeGen::new(&mut ctx, DEBUG_MODE);
+
+        let ir = source_to_ir("'()").expect("failed to parse");
+        let result = codegen.repl_compile(ir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "nil");
     }
 }
