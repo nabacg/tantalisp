@@ -159,14 +159,23 @@ impl IrLoweringContext {
             self.emit_constant(Type::List, Constant::Nil).unwrap()
         });
         let return_type = self.get_ssa_type(return_val)?;
-        if needs_boxing(&return_type) {
-            return_val = self.emit_box(return_val)?;
+
+        // Entry point must always return BoxedLispVal for REPL
+        // Box everything except values that are already boxed
+        match return_type {
+            Type::BoxedLispVal | Type::Any => {
+                // Already boxed, no need to box again
+            }
+            _ => {
+                // Box everything else (Int, Bool, String, List, etc.)
+                return_val = self.emit_box(return_val)?;
+            }
         }
 
         let bb = self.current_block()?;
-        
         bb.terminate(Terminator::Return { value: return_val });
 
+<<<<<<< HEAD
         // finish the function and it to namespace
 <<<<<<< HEAD
         let func = self.builder.finish(toplevel_id, "<toplevel>".to_string(), vec![], Type::Any);
@@ -176,8 +185,15 @@ impl IrLoweringContext {
 =======
         let func = self.builder.finish(toplevel_id,
                  "<toplevel>".to_string(), 
+=======
+        // finish the function and add it to namespace
+        let func = self.builder.finish(
+            toplevel_id,
+            "<toplevel>".to_string(),
+>>>>>>> cfa5c66 (simple lambda return_type inference based on body's last expression)
             vec![],
-             Type::BoxedLispVal); // <toplevel> is required to retun BoxedLispVal
+            Type::BoxedLispVal  // Entry point always returns BoxedLispVal for REPL
+        );
         self.namespace.add_function(func);
         self.namespace.set_entry_fn(toplevel_id);
         
@@ -399,16 +415,32 @@ impl IrLoweringContext {
          self.current_params = typed_params.clone();
 
          let mut result = self.lower_block(body)?;
-
-         // Box the return value if needed (same as lower_program)
          let result_type = self.get_ssa_type(result)?;
-         if needs_boxing(&result_type) {
-             result = self.emit_box(result)?;
-         }
 
-         let bb  = self.current_block()?;
+         // Decide the function's return type and box if necessary
+         let return_type = match &result_type {
+             Type::Int | Type::Bool => {
+                 // Scalar types: return unboxed for performance!
+                 result_type.clone()
+             }
+             Type::String | Type::List | Type::Vector => {
+                 // Heap types: already pointers, return as-is
+                 result_type.clone()
+             }
+             Type::Any | Type::Union(_) => {
+                 // Unknown/mixed types: must box
+                 result = self.emit_box(result)?;
+                 Type::BoxedLispVal
+             }
+             _ => {
+                 // Conservative: box everything else
+                 result = self.emit_box(result)?;
+                 Type::BoxedLispVal
+             }
+         };
+
+         let bb = self.current_block()?;
          bb.terminate(Terminator::Return { value: result });
-
 
          // swap builder and env back
          let lambda_builder = std::mem::replace(&mut self.builder, old_builder);
@@ -416,29 +448,40 @@ impl IrLoweringContext {
          self.current_params = old_params;
 
          // now lambda_builder can be consumed (with it's blocks etc.) to finish function definition
-         // All lambdas return BoxedLispVal for uniform calling convention
-         let func = lambda_builder.finish(fun_id, "unknown".to_string(), typed_params, Type::BoxedLispVal);
+         // Lambda return type is inferred (Int, Bool, BoxedLispVal, etc.)
+         let func = lambda_builder.finish(
+             fun_id,
+             format!("lambda_{}", fun_id.0),  // Auto-generated name
+             typed_params.clone(),
+             return_type.clone()
+         );
          self.namespace.add_function(func);
 
          let param_names: HashSet<String> = params.iter().filter_map(|p| match p {
-            SExpr::Symbol(sym) => Some(sym.clone()),
-            _ => None
+             SExpr::Symbol(sym) => Some(sym.clone()),
+             _ => None
          })
          .collect();
-        // recursively traverse body, keeping track of declared params to find free variables 
-        // i.e. variables used that are not a parameter
-        let free_variables = self.collect_free_vars(body, &param_names);
+         // recursively traverse body, keeping track of declared params to find free variables
+         // i.e. variables used that are not a parameter
+         let free_variables = self.collect_free_vars(body, &param_names);
 
-         // we only want to capture those free_vars that are present in current env 
-         let captured_env =  free_variables
-            .iter()
-            .filter_map(|v| self.env.get(v).copied())
-            .collect();
+         // we only want to capture those free_vars that are present in current env
+         let captured_env = free_variables
+             .iter()
+             .filter_map(|v| self.env.get(v).copied())
+             .collect();
 
-         let dest = self.builder.fresh_ssa(Type::Any);
+         // Build proper function type for the closure
+         let func_type = Type::Function {
+             params: typed_params.iter().map(|p| p.ty.clone()).collect(),
+             return_type: Box::new(return_type)
+         };
+
+         let dest = self.builder.fresh_ssa(func_type);
          let dest_id = dest.id;
          let bb = self.current_block()?;
-         bb.emit(Instruction::MakeClosure { dest, func: fun_id, captures: captured_env});
+         bb.emit(Instruction::MakeClosure { dest, func: fun_id, captures: captured_env });
 
          Ok(dest_id)
 
@@ -458,12 +501,22 @@ impl IrLoweringContext {
             }
         }
 
+
+
         let func_val = self.lower_expr(fun)?;
+        let func_type = self.get_ssa_type(func_val)?;
+        // Extract return type from function signature
+        let return_type = match &func_type {
+            Type::Function { return_type, .. } => return_type.as_ref().clone(),
+            Type::Any => Type::Any,  // Unknown function, assume boxed
+            _ => bail!("Cannot call non-function type")
+        };
+
         let arg_vals: Result<Vec<_>> = args.iter()
                 .map(|a| self.lower_expr(a))
                 .collect();
         let arg_vals = arg_vals?;
-        let dest = self.builder.fresh_ssa(Type::Any);
+        let dest = self.builder.fresh_ssa(return_type);
         let dest_id = dest.id;
         let bb = self.current_block()?;
         bb.emit(Instruction::Call { dest, func: func_val, args: arg_vals });
