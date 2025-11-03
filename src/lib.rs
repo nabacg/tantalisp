@@ -7,7 +7,7 @@ pub mod v2_codegen;
 
 use anyhow::{anyhow, Result};
 use inkwell::context::Context;
-use ir::ir_builder::lower_to_ir;
+use ir::lower_to_ir;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use lexer::tokenize;

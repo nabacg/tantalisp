@@ -174,7 +174,7 @@ impl RefCountOptimizer {
 #[cfg(test)]
 mod ref_count_optimizer_tests {
     use super::*;
-    use crate::{ir::ir_builder::lower_to_ir, lexer::tokenize, parser::parse};
+    use crate::{ir::lower_to_ir, lexer::tokenize, parser::parse};
 
     /// Set to true to print IR before and after optimization
     const DEBUG_IR: bool = false;

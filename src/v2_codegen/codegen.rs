@@ -283,8 +283,18 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn emit_ns(&mut self, ns: Namespace) -> Result<String> {
+        // Two-pass compilation to handle forward references:
+        // Pass 1: Declare all function signatures and register them
         for (_id, f) in &ns.functions {
-            self.emit_fn(f)?;
+            let param_types: Vec<_> = f.params.iter().map(|p|p.ty.clone()).collect();
+            let fn_type = self.compute_fn_signature(&param_types, &f.return_type)?;
+            let fn_val = self.module.add_function(&f.name, fn_type, None);
+            self.functions.insert(f.id, fn_val);  // Register early for MakeClosure lookups
+        }
+
+        // Pass 2: Emit function bodies (now all functions are registered)
+        for (_id, f) in &ns.functions {
+            self.emit_fn_body(f)?;
         }
 
         let entry_fn = ns
@@ -293,12 +303,11 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(entry_fn.name.clone())
     }
 
-    fn emit_fn(&mut self, f: &Function) -> Result<()> {
-        let fn_name = &f.name; // TODO - don't forget to autogenerate those names in IR!
+    fn emit_fn_body(&mut self, f: &Function) -> Result<()> {
+        // Function already declared and registered in pass 1, just get it
+        let fn_val = *self.functions.get(&f.id)
+            .ok_or(anyhow!("Function {:?} not declared in pass 1", f.id))?;
 
-        let fn_type = self.compute_fn_signature(&f.params, &f.return_type)?;
-
-        let fn_val = self.module.add_function(&fn_name, fn_type, None);
         self.current_function = Some(fn_val);
 
         for bb in &f.blocks {
@@ -306,16 +315,16 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         if !fn_val.verify(true) {
-            bail!("Function verification failed");
+            bail!("Function verification failed: {}", f.name);
         }
 
         Ok(())
     }
 
-    fn compute_fn_signature(&self, params: &[TypedValue], return_type: &Type) -> Result<FunctionType<'ctx>> {
+    fn compute_fn_signature(&self, params: &[Type], return_type: &Type) -> Result<FunctionType<'ctx>> {
         let param_types: Result<Vec<_>> = params
             .iter()
-            .map(|p| self.type_to_metadata_type(&p.ty))
+            .map(|ty| self.type_to_metadata_type(&ty))
             .collect();
         let param_types = param_types?;
 
@@ -339,8 +348,9 @@ impl<'ctx> CodeGen<'ctx> {
     fn emit_basic_block(&mut self, f: &Function, bb: &crate::ir::instructions::BasicBlock) -> Result<()> {
 
         let fn_val = self.curren_fn_val()?;
-        let entry_bb = self.ctx.append_basic_block(fn_val, &f.name);
-        self.builder.position_at_end(entry_bb);
+        let llvm_bb = self.ctx.append_basic_block(fn_val, &bb.id.to_string());
+        self.basic_blocks.insert(bb.id, llvm_bb);  // Register block for phi node lookups
+        self.builder.position_at_end(llvm_bb);
 
         for i in &bb.instructions {
             self.emit_instruction(bb, i)?;
@@ -363,48 +373,137 @@ impl<'ctx> CodeGen<'ctx> {
                         self.ssa_values.insert(dest.id, (dest.ty.clone(), val));
                         Ok(())
                     },
-            instructions::Instruction::DirectCall { dest, func, args } => todo!(),
-            instructions::Instruction::Call { dest, func, args } => todo!(),
-            instructions::Instruction::MakeClosure { dest, func, captures } => todo!(),
-            instructions::Instruction::MakeVector { dest, elements } => todo!(),
-            instructions::Instruction::MakeList { dest, elements } => todo!(),
-            instructions::Instruction::Retain { value } => todo!(),
-            instructions::Instruction::Release { value } => todo!(),
-            instructions::Instruction::Phi { dest, incoming } => todo!(),
-            instructions::Instruction::Box { dest, value } => {
-                let (ty, val) = self.lookup_ssa_id_with_type(value)?;
-                let boxed = match ty {
-                    Type::Int => {
-                        let int_val = val.into_int_value();
-                        self.box_int(int_val)?
-                    }
-                    Type::Bool => {
-                        let bool_val = val.into_int_value();
-                        self.box_bool(bool_val)?
-                    }
-                    Type::String | Type::List | Type::Vector | Type::BoxedLispVal => {
-                        val.into_pointer_value()
-                    }
-                    _ => bail!("Cannot box type: {:?}", ty)
-                };
-                self.ssa_values.insert(dest.id, (dest.ty.clone(), boxed.into()));
+            instructions::Instruction::DirectCall { dest, func, args } => {
+                let func_val = self.lookup_function(func)?;
+
+                // Lookup argument values (copy them to avoid holding references)
+                let arg_vals: Result<Vec<_>> = args.iter().map(|a| self.lookup_ssa_id(a).copied()).collect();
+                let arg_vals = arg_vals?;
+
+                // Convert to metadata for call
+                let args_metadata: Vec<_> = arg_vals.iter().map(|&a| a.into()).collect();
+
+                let call_val = self.builder.build_call(*func_val, &args_metadata, "direct_function_call")?;
+                let call_result = call_val.try_as_basic_value().left().ok_or(anyhow!("Failed to get call result as basic value"))?;
+
+                // Release all arguments after the call (caller owns them)
+                for arg in arg_vals {
+                    self.release_value(arg)?;
+                }
+
+                self.ssa_values.insert(dest.id, (dest.ty.clone(), call_result));
                 Ok(())
+            },
+            instructions::Instruction::Call { dest, func, args } => {
+                let (lambda_type, func_val) = self.lookup_ssa_id_with_type(func)?;
+
+                // Lookup argument values (copy them to avoid holding references)
+                let arg_vals: Result<Vec<_>> = args.iter().map(|a| self.lookup_ssa_id(a).copied()).collect();
+                let arg_vals = arg_vals?;
+
+                // Convert to metadata for call
+                let args_metadata: Vec<_> = arg_vals.iter().map(|&a| a.into()).collect();
+
+                if let Type::Function { params, return_type } = lambda_type {
+                    let fn_type = self.compute_fn_signature(&params, &*return_type)?;
+                    let lisp_val_ptr = func_val.into_pointer_value();
+                    let func_val_ptr = self.unbox_lambda(lisp_val_ptr)?;
+
+                    let call_val = self.builder.build_indirect_call(fn_type, func_val_ptr, &args_metadata, "indirect_function_call")?;
+                    let call_result = call_val.try_as_basic_value().left().ok_or(anyhow!("Failed to get call result as basic value"))?;
+
+                    // Release the lambda itself (caller owns it)
+                    self.release_value(lisp_val_ptr.into())?;
+
+                    // Release all arguments after the call (caller owns them)
+                    for arg in arg_vals {
+                        self.release_value(arg)?;
+                    }
+
+                    self.ssa_values.insert(dest.id, (dest.ty.clone(), call_result));
+                    Ok(())
+                } else {
+                    bail!("Invalid type for SsaId: {}, only Type::Function allowed in call position, found: {}", dest.id,  lambda_type)
+                }
 
             },
-            instructions::Instruction::Unbox { dest, value, expected_type } => {
-                let lisp_val_ptr = self.lookup_ssa_id(value)?.into_pointer_value();
-                let unboxed = match expected_type {
-                    Type::Int => self.unbox_int(lisp_val_ptr)?.into(),
-                    Type::Bool => self.unbox_bool(lisp_val_ptr)?.into(),
-                    Type::String => self.unbox_string(lisp_val_ptr)?.into(),
-                    _ => bail!("Cannot unbox to type: {}", expected_type)
-                };
-                self.ssa_values.insert(dest.id, (expected_type.clone(), unboxed));
-                Ok(())
-            },
+            instructions::Instruction::MakeClosure { dest, func, captures } => self.emit_lambda(dest, func, captures),
+            instructions::Instruction::MakeVector { dest, elements } => todo!(),
+            instructions::Instruction::MakeList { dest, elements } => todo!(),
+            instructions::Instruction::Retain { value } => self.emit_retain(value),
+            instructions::Instruction::Release { value } => self.emit_release(value),
+            instructions::Instruction::Phi { dest, incoming } => self.emit_phi(dest, incoming),
+            instructions::Instruction::Box { dest, value } => self.emit_box(dest, value),
+            instructions::Instruction::Unbox { dest, value, expected_type } => self.emit_unbox(dest, value, expected_type),
         }
     }
 
+    fn emit_lambda(&mut self, dest: &TypedValue, func: &FunctionId, captures: &Vec<SsaId>) -> Result<()> {
+        // each lambda will be emited at top level Namespace loop, so we just need to look it up here
+        let fn_val = self.lookup_function(func)?;
+        // need to box it so it can be returned as value
+        let boxed_lambda = self.box_lambda(*fn_val)?;
+        if !captures.is_empty() { 
+            println!("Need to handle closure environment");
+        }
+        self.ssa_values.insert(dest.id, (dest.ty.clone(), boxed_lambda.into()));
+        Ok(())
+    }
+
+    fn lookup_function(&self, func: &FunctionId) -> Result<&FunctionValue<'ctx>> {
+        self.functions.get(func).ok_or(anyhow!("Function: {:?} not found", func))
+    }
+    
+    fn emit_unbox(&mut self, dest: &TypedValue, value: &SsaId, expected_type: &Type) -> Result<()> {
+        let lisp_val_ptr = self.lookup_ssa_id(value)?.into_pointer_value();
+        let unboxed = match expected_type {
+            Type::Int => self.unbox_int(lisp_val_ptr)?.into(),
+            Type::Bool => self.unbox_bool(lisp_val_ptr)?.into(),
+            Type::String => self.unbox_string(lisp_val_ptr)?.into(),
+            _ => bail!("Cannot unbox to type: {}", expected_type)
+        };
+        self.ssa_values.insert(dest.id, (expected_type.clone(), unboxed));
+        Ok(())
+    }
+    
+    fn emit_box(&mut self, dest: &TypedValue, value: &SsaId) -> Result<()> {
+        let (ty, val) = self.lookup_ssa_id_with_type(value)?;
+        let boxed = match ty {
+            Type::Int => {
+                let int_val = val.into_int_value();
+                self.box_int(int_val)?
+            }
+            Type::Bool => {
+                let bool_val = val.into_int_value();
+                self.box_bool(bool_val)?
+            }
+            Type::String | Type::List | Type::Vector | Type::BoxedLispVal => {
+                val.into_pointer_value()
+            }
+            _ => bail!("Cannot box type: {:?}", ty)
+        };
+        self.ssa_values.insert(dest.id, (dest.ty.clone(), boxed.into()));
+        Ok(())
+    }
+    
+    fn emit_phi(&mut self, dest: &TypedValue, incoming: &Vec<(SsaId, BlockId)>) -> Result<()> {
+        let phi_node_type = self.type_to_basic_type(&dest.ty)?;
+        let phi_node = self.builder.build_phi(phi_node_type, "phi_node")?;
+        // First collect the BasicValueEnum references and blocks
+        let incoming_pairs: Vec<(&BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = incoming.iter().map(|(ssa_id, block_id)| {
+            let incoming_val = self.lookup_ssa_id(ssa_id)?;
+            let bb = self.lookup_block_id(block_id)?;
+            Ok((incoming_val, *bb))
+        }).collect::<Result<Vec<_>>>()?;
+        // Now build the trait object slice for add_incoming
+        let incoming_trait_objects: Vec<(&dyn BasicValue<'ctx>, BasicBlock<'ctx>)> =
+            incoming_pairs.iter().map(|(val, bb)| (*val as &dyn BasicValue<'ctx>, *bb)).collect();
+        phi_node.add_incoming(&incoming_trait_objects);
+        let cond_result = phi_node.as_basic_value();
+        self.ssa_values.insert(dest.id, (dest.ty.clone(), cond_result));
+        Ok(())
+    }
+    
     fn emit_prim_op(&mut self, op: &Operator, args: &[SsaId]) -> Result<BasicValueEnum<'ctx>> {
         let arg_vals: Result<Vec<_>> = args.iter().map(|ssa_id| self.lookup_ssa_id(ssa_id)).collect();
         let arg_vals = arg_vals?;
@@ -474,6 +573,37 @@ impl<'ctx> CodeGen<'ctx> {
         
 
         Ok(str_ptr)
+    }
+
+
+    fn emit_retain(&mut self, id: &SsaId) -> Result<()> {
+        let val = *self.lookup_ssa_id(id)?;
+        self.builder.build_call(self.retain_fn, &[val.into()], "retain_call")?;
+        Ok(())
+    }
+
+    fn emit_release(&mut self, id: &SsaId) -> Result<()> {
+        let val = *self.lookup_ssa_id(id)?;
+        self.release_value(val)
+    }
+
+    // Helper to release a BasicValueEnum directly (for call cleanup)
+    fn release_value(&mut self, val: BasicValueEnum<'ctx>) -> Result<()> {
+        self.builder.build_call(self.release_fn, &[val.into()], "release_call")?;
+        Ok(())
+    }
+
+    fn box_lambda(&mut self, func: FunctionValue<'ctx>) -> Result<PointerValue<'ctx>> {
+        let lisp_val_ptr = self.alloc_lisp_val()?;
+
+        // Set tag to TAG_LAMBDA
+        self.lisp_val_set_tag(lisp_val_ptr, TAG_LAMBDA)?;
+
+        // Convert function pointer and store in data field
+        let func_ptr = func.as_global_value().as_pointer_value();
+        self.lisp_val_set_ptr_data(lisp_val_ptr, func_ptr)?;
+
+        Ok(lisp_val_ptr)
     }
 
 
@@ -880,7 +1010,7 @@ impl<'ctx> Drop for CodeGen<'ctx> {
 
 #[cfg(test)]
 mod codegen_test {
-    use crate::{ir::ir_builder::lower_to_ir, lexer::tokenize, parser::parse};
+    use crate::{ir::lower_to_ir, lexer::tokenize, parser::parse};
     use super::*;
 
     const DEBUG_MODE: bool = false;
