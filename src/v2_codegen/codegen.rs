@@ -100,6 +100,14 @@ impl<'ctx> CodeGen<'ctx> {
                 old_entry_point_fn.delete();
             }
         }
+
+        if self.debug {
+            // Print SSA IR before LLVM codegen
+            println!("-------- SSA IR ----------");
+            println!("{}", ns);
+            println!("--------------------------\n");
+        }
+
         // Compile exprs
         let entry_fn_name = self.emit_ns(ns)?;
         if self.debug {
@@ -131,6 +139,13 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     pub fn compile_and_run(&mut self, ns: Namespace) -> Result<String> {
+        if self.debug {
+            // Print SSA IR before LLVM codegen
+            println!("-------- SSA IR ----------");
+            println!("{}", ns);
+            println!("--------------------------\n");
+        }
+
         let entry_fn_name = self.emit_ns(ns)?;
 
         if self.debug {
@@ -373,60 +388,8 @@ impl<'ctx> CodeGen<'ctx> {
                         self.ssa_values.insert(dest.id, (dest.ty.clone(), val));
                         Ok(())
                     },
-            instructions::Instruction::DirectCall { dest, func, args } => {
-                let func_val = self.lookup_function(func)?;
-
-                // Lookup argument values (copy them to avoid holding references)
-                let arg_vals: Result<Vec<_>> = args.iter().map(|a| self.lookup_ssa_id(a).copied()).collect();
-                let arg_vals = arg_vals?;
-
-                // Convert to metadata for call
-                let args_metadata: Vec<_> = arg_vals.iter().map(|&a| a.into()).collect();
-
-                let call_val = self.builder.build_call(*func_val, &args_metadata, "direct_function_call")?;
-                let call_result = call_val.try_as_basic_value().left().ok_or(anyhow!("Failed to get call result as basic value"))?;
-
-                // Release all arguments after the call (caller owns them)
-                for arg in arg_vals {
-                    self.release_value(arg)?;
-                }
-
-                self.ssa_values.insert(dest.id, (dest.ty.clone(), call_result));
-                Ok(())
-            },
-            instructions::Instruction::Call { dest, func, args } => {
-                let (lambda_type, func_val) = self.lookup_ssa_id_with_type(func)?;
-
-                // Lookup argument values (copy them to avoid holding references)
-                let arg_vals: Result<Vec<_>> = args.iter().map(|a| self.lookup_ssa_id(a).copied()).collect();
-                let arg_vals = arg_vals?;
-
-                // Convert to metadata for call
-                let args_metadata: Vec<_> = arg_vals.iter().map(|&a| a.into()).collect();
-
-                if let Type::Function { params, return_type } = lambda_type {
-                    let fn_type = self.compute_fn_signature(&params, &*return_type)?;
-                    let lisp_val_ptr = func_val.into_pointer_value();
-                    let func_val_ptr = self.unbox_lambda(lisp_val_ptr)?;
-
-                    let call_val = self.builder.build_indirect_call(fn_type, func_val_ptr, &args_metadata, "indirect_function_call")?;
-                    let call_result = call_val.try_as_basic_value().left().ok_or(anyhow!("Failed to get call result as basic value"))?;
-
-                    // Release the lambda itself (caller owns it)
-                    self.release_value(lisp_val_ptr.into())?;
-
-                    // Release all arguments after the call (caller owns them)
-                    for arg in arg_vals {
-                        self.release_value(arg)?;
-                    }
-
-                    self.ssa_values.insert(dest.id, (dest.ty.clone(), call_result));
-                    Ok(())
-                } else {
-                    bail!("Invalid type for SsaId: {}, only Type::Function allowed in call position, found: {}", dest.id,  lambda_type)
-                }
-
-            },
+            instructions::Instruction::DirectCall { dest, func, args } => self.emit_direct_call(dest, func, args),
+            instructions::Instruction::Call { dest, func, args } => self.emit_call(dest, func, args),
             instructions::Instruction::MakeClosure { dest, func, captures } => self.emit_lambda(dest, func, captures),
             instructions::Instruction::MakeVector { dest, elements } => todo!(),
             instructions::Instruction::MakeList { dest, elements } => todo!(),
@@ -438,6 +401,75 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    fn emit_call(&mut self, dest: &TypedValue, func: &SsaId, args: &Vec<SsaId>) -> std::result::Result<(), anyhow::Error> {
+        let (lambda_type, func_val) = self.lookup_ssa_id_with_type(func)?;
+        // Lookup argument values (copy them to avoid holding references)
+        let arg_vals: Result<Vec<_>> = args.iter().map(|a| self.lookup_ssa_id(a).copied()).collect();
+        let arg_vals = arg_vals?;
+        // Convert to metadata for call
+        let args_metadata: Vec<_> = arg_vals.iter().map(|&a| a.into()).collect();
+        if let Type::Function { params, return_type } = lambda_type {
+            let fn_type = self.compute_fn_signature(&params, &*return_type)?;
+            let lisp_val_ptr = func_val.into_pointer_value();
+            let func_val_ptr = self.unbox_lambda(lisp_val_ptr)?;
+    
+            let call_val = self.builder.build_indirect_call(fn_type, func_val_ptr, &args_metadata, "indirect_function_call")?;
+            let call_result = call_val.try_as_basic_value().left().ok_or(anyhow!("Failed to get call result as basic value"))?;
+    
+            // Release the lambda itself (caller owns it)
+            self.release_value(lisp_val_ptr.into())?;
+    
+            // Lookup argument values with their types
+            let arg_vals_with_types: Vec<(Type, BasicValueEnum)> = args.iter()
+                .map(|a| {
+                    let (ty, val) = self.lookup_ssa_id_with_type(a)?;
+                    Ok((ty.clone(), *val))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            // Release only arguments that need refcounting
+            for (ty, arg) in arg_vals_with_types {
+                if ty.needs_rc() {  // Only String, List, Vector, Function
+                    self.release_value(arg)?;
+                }
+            }
+    
+            self.ssa_values.insert(dest.id, (dest.ty.clone(), call_result));
+            Ok(())
+        } else {
+            bail!("Invalid type for SsaId: {}, only Type::Function allowed in call position, found: {}", dest.id,  lambda_type)
+        }
+    }
+    
+    fn emit_direct_call(&mut self, dest: &TypedValue, func: &FunctionId, args: &Vec<SsaId>) -> std::result::Result<(), anyhow::Error> {
+        let func_val = self.lookup_function(func)?;
+        // Lookup argument values (copy them to avoid holding references)
+        let arg_vals: Result<Vec<_>> = args.iter().map(|a| self.lookup_ssa_id(a).copied()).collect();
+        let arg_vals = arg_vals?;
+        // Convert to metadata for call
+        let args_metadata: Vec<_> = arg_vals.iter().map(|&a| a.into()).collect();
+        let call_val = self.builder.build_call(*func_val, &args_metadata, "direct_function_call")?;
+        let call_result = call_val.try_as_basic_value().left().ok_or(anyhow!("Failed to get call result as basic value"))?;
+
+          // Lookup argument values with their types
+        let arg_vals_with_types: Vec<(Type, BasicValueEnum)> = args.iter()
+            .map(|a| {
+                let (ty, val) = self.lookup_ssa_id_with_type(a)?;
+                Ok((ty.clone(), *val))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Release only arguments that need refcounting
+        for (ty, arg) in arg_vals_with_types {
+            if ty.needs_rc() {  // Only String, List, Vector, Function
+                self.release_value(arg)?;
+            }
+        }
+  
+        self.ssa_values.insert(dest.id, (dest.ty.clone(), call_result));
+        Ok(())
+    }
+    
     fn emit_lambda(&mut self, dest: &TypedValue, func: &FunctionId, captures: &Vec<SsaId>) -> Result<()> {
         // each lambda will be emited at top level Namespace loop, so we just need to look it up here
         let fn_val = self.lookup_function(func)?;
@@ -477,7 +509,8 @@ impl<'ctx> CodeGen<'ctx> {
                 let bool_val = val.into_int_value();
                 self.box_bool(bool_val)?
             }
-            Type::String | Type::List | Type::Vector | Type::BoxedLispVal => {
+            Type::String | Type::List | Type::Vector | Type::BoxedLispVal | Type::Any => {
+                // Already a boxed pointer, just pass through
                 val.into_pointer_value()
             }
             _ => bail!("Cannot box type: {:?}", ty)
@@ -1013,7 +1046,7 @@ mod codegen_test {
     use crate::{ir::lower_to_ir, lexer::tokenize, parser::parse};
     use super::*;
 
-    const DEBUG_MODE: bool = false;
+    const DEBUG_MODE: bool = true;
 
     fn source_to_ir(source: &str) -> Result<Namespace> {
         let tokens = tokenize(source)?;
