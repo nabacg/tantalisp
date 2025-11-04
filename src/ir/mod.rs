@@ -2,7 +2,7 @@ use instructions::Namespace;
 use ir_builder::IrLoweringContext;
 use ref_count_optimizer::RefCountOptimizer;
 
-use crate::parser::SExpr;
+use crate::{ir::type_inference::TypeInference, parser::SExpr};
 use anyhow::Result;
 
 pub mod ir_types;
@@ -23,6 +23,9 @@ pub fn lower_to_ir(ast: &[SExpr]) -> Result<Namespace> {
 
     let mut ref_count_opto = RefCountOptimizer::new();
     ref_count_opto.process(&mut ir)?;
+
+    let mut type_inference = TypeInference::new();
+    type_inference.process(&mut ir)?;
 
     Ok(ir)
 }

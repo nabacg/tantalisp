@@ -205,7 +205,6 @@ impl TypeInference {
         // calculate basic block predecessors for each BB
         f.compute_predecessors();
 
-        println!("Processing fn_id: {:?}", f.id);
         self.initalize_types(f);
 
         // init worklist with the entry BB id
@@ -252,7 +251,6 @@ impl TypeInference {
         let bb = f.find_bloc(bb_id)
                                 .ok_or(anyhow!("Unknown blockId: {} in FunctionId: {:?}", bb_id, f.id))?;
 
-        println!("Processing BB id: {}", bb_id);
         let mut type_changed = false;
         for i in &bb.instructions {
             let new_type = self.infer_instruction(i, f, runtime_get_var, global_env)?;
@@ -338,6 +336,8 @@ impl TypeInference {
                     .fold(Type::Bottom, |acc, ty| acc.join(ty));
                 Ok(joined_type)
             },
+            Instruction::Box { dest, value } => Ok(Type::BoxedLispVal),
+            Instruction::Unbox { dest, value, expected_type } => Ok(expected_type.clone()),
         }
     }
     

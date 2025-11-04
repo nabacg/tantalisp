@@ -171,30 +171,18 @@ impl IrLoweringContext {
         let bb = self.current_block()?;
         bb.terminate(Terminator::Return { value: return_val });
 
-<<<<<<< HEAD
-        // finish the function and it to namespace
-<<<<<<< HEAD
-        let func = self.builder.finish(toplevel_id, "<toplevel>".to_string(), vec![], Type::Any);
-        let func_id = func.id;
-        self.namespace.add_function(func);
-        self.namespace.set_entry_point(func_id);
-=======
-        let func = self.builder.finish(toplevel_id,
-                 "<toplevel>".to_string(), 
-=======
+
         // finish the function and add it to namespace
         let func = self.builder.finish(
             toplevel_id,
             "<toplevel>".to_string(),
->>>>>>> cfa5c66 (simple lambda return_type inference based on body's last expression)
             vec![],
             Type::BoxedLispVal  // Entry point always returns BoxedLispVal for REPL
         );
         self.namespace.add_function(func);
         self.namespace.set_entry_fn(toplevel_id);
         
->>>>>>> c345a8c (codegen_v2 using our lowered SSA based IR! currently can do simple integer math only, but it does it without constant boxing / unboxing like before! WIP but it's a milestone!)
-        Ok(self.namespace)
+      Ok(self.namespace)
 
     }
 
